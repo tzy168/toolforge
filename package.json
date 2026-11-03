@@ -1,0 +1,31 @@
+{
+  "name": "toolforge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "创建你自己的 Agent —— 一切皆 Tool 的桌面端 Agent",
+  "main": "dist/electron/main.cjs",
+  "packageManager": "pnpm@11.21.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.ui.json && node scripts/copy-ui-vendor.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit",
+    "start": "pnpm build && node dist/bin/start.cjs",
+    "cli": "pnpm build && node dist/bin/cli.js",
+    "test": "pnpm build && node --test dist/test/loop.test.js",
+    "selftest": "pnpm build && node dist/bin/cli.js --selftest"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "dompurify": "^3.4.17",
+    "marked": "^18.1.2",
+    "openai": "^4.77.0"
+  },
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^33.4.11",
+    "typescript": "^5.7.0"
+  }
+}
