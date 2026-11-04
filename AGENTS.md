@@ -107,6 +107,7 @@ untested ──用例通过、低危──> active
 - 只改 UI 时也要跑一次 `pnpm build`，`src/ui/build/app.js` 是产物且被 gitignore，`index.html` 直接引它。
 - 测试一律把 `TOOLFORGE_HOME` 指到临时目录，别污染真实的 `~/.toolforge`。
 - 非平凡逻辑要留一条能失败的检查：`test/loop.test.ts` 里新增断言后，用变异验证一次（把被测逻辑改坏，确认断言真的红），再改回来。
+- 改动设置页「工具仓库」的等级 tab / 名称搜索时，跑 `pnpm verify:toolfilter`：它在真实界面里点 tab、敲搜索框，断言等级筛选、模糊搜索、两者叠加、空状态与「刷新后条件不丢」共 12 项。
 - 改动渲染层的任务切换 / 流式渲染时，跑 `pnpm verify:switch`：它起一个假模型服务，自动走一遍「发送 → 切走 → 切回 → 暂停 → 历史续聊 → 卡死超时解锁」，共 16 项断言。改这块之前先跑一次，确认基线是绿的。
 
 ## 常见坑
@@ -120,13 +121,15 @@ untested ──用例通过、低危──> active
 - **流式渲染要按帧合并**：`delta` 事件可能几十毫秒来一片，每片都 `markdownToHtml` 重解析是 O(n²)，`app.ts` 用 `requestAnimationFrame` 节流。别把这一层去掉。
 - **别在流式输出时强制 `scrollTop` 到底**：用户往上翻着读时硬拽回底部等于不让人看，`scrollBottom()` 只在贴底时才滚。
 - **等待态的心跳只有一个**：`startTicker()` / `stopTicker()` 全局共用一个 100ms 定时器，同时刷新等待秒表和所有 `.call-chip.running` 的耗时。别给每个元素各开一个 `setInterval`——轮次结束忘清一个就是泄漏。
-- **在飞的那一轮存数据，不存 DOM**：`liveRun`（`LiveRun`）记着 taskId、pendingInput、thinking、reasoning、segments。**别把它改回持有 DOM 节点**——`renderHistory()` 会 `inner.innerHTML = ''`，节点立刻成孤儿，事件继续往里写但用户看不到，切回该任务时上下文全空。用户随时可能切走，`renderHistory` 必须靠 liveRun 把这一轮重建出来。
+- **在飞的那一轮存数据，不存 DOM**：`liveRun`（`LiveRun`）记着 taskId、pendingInput、thinking、segments（正文 / 工具 / 思考按产出顺序）。**别把它改回持有 DOM 节点**——`renderHistory()` 会 `inner.innerHTML = ''`，节点立刻成孤儿，事件继续往里写但用户看不到，切回该任务时上下文全空。用户随时可能切走，`renderHistory` 必须靠 liveRun 把这一轮重建出来。
 - **一轮必须有兜底超时**：`armWatchdog()` 到点调 `forceFinish()` 强制解锁。没有它，任何一个卡死的请求都会让 `busy` 永远为 true——之后所有输入被 `if (busy) return` 静默吞掉，用户看到的就是「输入框打不了字」。`?turnTimeout=<ms>` 可覆盖（探针靠它压到 2 秒来验证）。
 - **`busy` 时别静默 return**：`send()` 在忙时会弹提示说明「上一轮还在跑，可以暂停」。静默返回会让人以为输入框坏了。
 - **工具数只数用户工具**：`ForgeState.toolCount` 用 `store.usable() + mcp.listTools()`，**不含**内核元工具（`list_tools`/`tool_search`/`create_tool`）。算进来会和设置页的「工具仓库 N」对不上，看着像数错了。`runLoop` 里的 `step.toolCount` 同理，已排除 `META_TOOL_NAMES`。
 - **事件可能来自别的任务**：`onEvent` 里先判断 `activeId === liveRun.taskId`，是才碰 DOM，否则只更新数据。别无条件往界面上写。
-- **工具轨迹按模型产出顺序穿插**：`LiveRun.segments` 是有序片段（`text` / `tool` 交错），别改回「所有工具堆一个 `.trace` 放气泡上方」——那样读起来像「先把活全干完再说」，而真实节奏是「说一句 → 调工具 → 再看结果说一句」。
-- **推理内容走 `reasoning` 事件**：`streamOnce` 同时认 `delta.reasoning_content` 和 `delta.reasoning`（各家字段名不同）。前端收进 `liveRun.reasoning`，渲染成默认折叠的 `<details class="reasoning">`，跑完自动收起。
+- **工具轨迹按模型产出顺序穿插**：`LiveRun.segments` 是有序片段（`text` / `tool` / `reasoning` 交错），别改回「所有工具堆一个 `.trace` 放气泡上方」——那样读起来像「先把活全干完再说」，而真实节奏是「说一句 → 调工具 → 再看结果说一句」。
+- **推理内容走 `reasoning` 事件**：`streamOnce` 同时认 `delta.reasoning_content` 和 `delta.reasoning`（各家字段名不同）。前端把它当成 `LiveRun.segments` 里的一种片段（`{kind:'reasoning'}`），**画在它自己那一步的位置上**，别再攒回一个字符串挂到轮次开头——多步任务里那样会变成一大坨对不上号的前言。默认「还在想就展开、想完就收起」。
+- **一轮结束后过程收进 `.process`，只留最终总结在明面上**：`persistProcess()` 把整条片段序列写进 `Task.process`（老字段 `reasoning` / `steps` 继续同步写，供旧数据与旧逻辑读），`renderHistory` 用 `processBlock()` 回放成默认折叠的 `<details class="process">`。最终回答本身在 `task.history` 里那条 assistant 消息，落盘时要把「流式拼进 segments 的最后一段文字」从过程里剔掉，否则总结会出现两遍（`isFinalAnswer()`）。
+- **收尾清 `liveRun` 前要 `await` 一个宏任务**：事件走 `webContents.send` 那条通道，可能比 `chat()` 的返回值晚一拍进渲染层。`send()` 里不先让出一次 `setTimeout(0)`，这一轮最后一步的 `reasoning` / `delta` / `assistant` 就会赶在 `liveRun = null` 之后才到，被 `if (!liveRun) return` 整批丢掉——表现是「过程块里少了最后一步的思考」，且时好时坏（`verify:switch` 靠这一步才稳定）。
 - **输入框永远别禁用**：`syncComposer()` 只控发送按钮和占位文案。禁用 textarea 会让用户以为程序卡死，而且切到别的任务时他本该能接着说别的事。挡重复提交靠 `busy` 标志。
 - **history 必须无条件落盘**：`send()` 无论成功失败都把 {user, assistant} push 进 `task.history`，否则切走再回来，用户的问题凭空消失。
 - **界面动效全部用纯 CSS 写**：视觉参考 ReactBits，但不引 React、不引 GSAP（界面无打包器 + CSP 禁 CDN）。新增动效必须同时进 `prefers-reduced-motion` 的白名单，且优先动画 `transform` / `opacity` / `background`，别动会触发重排的属性。

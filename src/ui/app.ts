@@ -89,7 +89,32 @@ interface Bridge {
   openWorkspace: (dir: string) => Promise<Envelope<unknown>>;
   exportPack: (payload: { name: string; ids: string[] }) => Promise<Envelope<{ canceled: boolean; path?: string; count?: number }>>;
   importPack: () => Promise<Envelope<{ canceled: boolean; results?: Array<{ ok: boolean; skipped?: string; error?: string }> }>>;
+  /** 关于页的静态信息，全部来自 package.json */
+  about: () => Promise<Envelope<AboutInfo>>;
+  /** 问 GitHub 要最新发版/标签。网络在主进程走，这里只拿结论 */
+  checkUpdate: () => Promise<Envelope<UpdateInfo>>;
+  /** 在系统浏览器里打开链接（只放行 https） */
+  openExternal: (url: string) => Promise<Envelope<unknown>>;
   onEvent: (cb: (event: EventPayload) => void) => void;
+}
+
+interface AboutInfo {
+  name: string;
+  version: string;
+  description: string;
+  repo: string;
+}
+
+interface UpdateInfo {
+  current: string;
+  /** 远端最新版本号；仓库还没有任何发版或标签时是 null */
+  latest: string | null;
+  hasUpdate: boolean;
+  /** 来源：release = 正式发版，tag = 只有标签 */
+  source: string;
+  url: string | null;
+  notes: string | null;
+  publishedAt: string | null;
 }
 
 declare global {
@@ -134,11 +159,26 @@ interface LiveTrace {
  *
  * 以前把所有工具堆在一个 `.trace` 里放在气泡上方，读起来像「先把所有活干完再说」，
  * 但模型其实是「说一句 → 调个工具 → 再看结果说一句」。所以改成有序片段：
- * 文本段与工具段交错，界面照原样重放。
+ * 正文、工具、思考都按真实顺序交错，界面照原样重放。
+ *
+ * 思考（reasoning）也在这条序列里，不再单独挂在轮次开头。模型是「这一步想完 → 说话/调工具」，
+ * 每一步的思考该出现在它自己那一步的位置上；攒成一个字符串塞在开头，
+ * 多步任务里就变成一大坨前言，谁也对不上哪段思考对应哪次调用。
  */
 type Segment =
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; trace: LiveTrace };
+  | { kind: 'tool'; trace: LiveTrace }
+  /** done：这一步已经想完（开始吐正文或调工具）。没想完的才默认展开 */
+  | { kind: 'reasoning'; text: string; done: boolean };
+
+/**
+ * 落盘用的片段：只留渲染需要的最小字段，且不带 t0 这类运行期时间戳。
+ * 一轮结束时整条序列存进 `Task.process`，重开任务才能按原位回放。
+ */
+type SavedSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'reasoning'; text: string }
+  | { kind: 'tool'; name: string; args: string; ok?: boolean; ms?: number };
 
 interface LiveRun {
   taskId: string;
@@ -146,16 +186,7 @@ interface LiveRun {
   pendingInput: string;
   /** 等待态文案，随 step 更新 */
   thinking: string;
-  /** 模型的思考链（reasoning 增量累积），可折叠展示 */
-  reasoning: string;
-  /**
-   * 这一步的思考是否已经收尾。
-   *
-   * 模型一旦开始吐正文或调工具，思考就已经结束了；标签得当场从「思考中…」翻成
-   * 「思考完成」，不能挂着「思考中…」等整轮跑完。下一步重新吐思考时再翻回去。
-   */
-  reasoningDone: boolean;
-  /** 按产出顺序排列的片段 */
+  /** 按产出顺序排列的片段（正文 / 工具 / 思考交错） */
   segments: Segment[];
   /**
    * 用户手动开合过的工具组：组序号 → 是否展开。
@@ -164,6 +195,11 @@ interface LiveRun {
    * 但用户点开过某一组时得记住他的意思，否则下一次重画又给合回去。
    */
   traceOpen: Map<number, boolean>;
+  /**
+   * 用户手动开合过的思考块：段序号（在 segments 里的下标）→ 是否展开。
+   * 默认是「还在想就展开、想完就收起」，但用户点开过的意思更优先。
+   */
+  reasonOpen: Map<number, boolean>;
   started: number;
 }
 
@@ -195,9 +231,14 @@ interface Task {
   at: number;
   /** 老数据没有这个字段，读出来是 undefined，按"未选"处理 */
   workspace?: TaskWorkspace;
-  /** 最后一条回答的思考过程，重开任务时仍可展开 */
+  /**
+   * 最后一轮的过程序列：思考、正文、工具按当时产出的顺序。
+   * 只留最后一轮（每轮对话都会覆盖），重开任务时按原位回放。
+   */
+  process?: SavedSegment[];
+  /** 最后一条回答的思考过程（老字段，只为兼容旧数据；新数据从 process 派生） */
   reasoning?: string;
-  /** 最后一条回答里调过的工具，按顺序 */
+  /** 最后一条回答里调过的工具（老字段，同上） */
   steps?: Array<{ name: string; args: string; ok?: boolean; ms?: number }>;
 }
 
@@ -287,8 +328,16 @@ function saveGroups(): void {
 
 let groups = loadGroups();
 
+/**
+ * 错峰入场只在本次页面第一次渲染时放。
+ * openTask() 每次都会 renderTasks() 重建整列，若每回都带上动画，点一下任务侧栏就抖一遍。
+ */
+let taskListEntered = false;
+
 function renderTasks(): void {
   const list = $<HTMLDivElement>('#taskList');
+  list.classList.toggle('enter', !taskListEntered);
+  taskListEntered = true;
   list.innerHTML = '';
   if (!tasks.length) {
     const tip = el('div', 'side-empty');
@@ -314,6 +363,8 @@ function renderTasks(): void {
     return weight(a) - weight(b);
   });
 
+  // 分组头和任务行共用一个自增序号，喂给 CSS 的 --i 做错峰入场（见 style.css）
+  let rowIndex = 0;
   for (const key of order) {
     const rows = byGroup.get(key)!;
     const ws = rows[0] ? taskWorkspace(rows[0]) : null;
@@ -327,21 +378,32 @@ function renderTasks(): void {
     gname.textContent = workspaceLabel(ws);
     const gcount = el('span', 'group-count');
     gcount.textContent = String(rows.length);
-    head.append(caret, gname, gcount);
+    // 分组上的「＋」：在这个工作区里直接开一条新任务，省掉「新建 + 再选工作区」两步
+    const gadd = el('button', 'group-add');
+    gadd.textContent = '＋';
+    gadd.title = `在「${workspaceLabel(ws)}」下新建任务`;
+    gadd.onclick = (e) => {
+      // 别让点击冒泡到分组头，否则会顺手把这一组折叠掉
+      e.stopPropagation();
+      newTaskIn(ws);
+    };
+    head.append(caret, gname, gcount, gadd);
     head.onclick = () => {
       groups[key] = !collapsed;
       saveGroups();
       renderTasks();
     };
+    head.style.setProperty('--i', String(rowIndex++));
     list.appendChild(head);
 
     if (collapsed) continue;
-    for (const task of rows) list.appendChild(taskRow(task));
+    for (const task of rows) list.appendChild(taskRow(task, rowIndex++));
   }
 }
 
-function taskRow(task: Task): HTMLElement {
+function taskRow(task: Task, index = 0): HTMLElement {
   const row = el('div', `task${task.id === activeId ? ' active' : ''}`);
+  row.style.setProperty('--i', String(index));
   row.title = task.title;
   const title = el('span', 'task-title');
   title.textContent = task.title;
@@ -392,10 +454,78 @@ function showPane(pane: string): void {
   document.querySelectorAll<HTMLElement>('.pane').forEach((p) => {
     p.hidden = p.dataset.pane !== pane;
   });
+  // 关于页的信息从主进程取，切过去时拉一次就够了（版本一次启动不会变）
+  if (pane === 'about') void refreshAbout();
 }
 
 document.querySelectorAll<HTMLElement>('.nav-item').forEach((nav) => {
   nav.addEventListener('click', () => showPane(nav.dataset.pane || 'tools'));
+});
+
+/* ---------------- 关于 ---------------- */
+
+/** 把版本、简介、仓库地址填进关于页。数据源是主进程读的 package.json，界面不自己写死 */
+async function refreshAbout(): Promise<void> {
+  if (!window.tf) return;
+  const res = await window.tf.about();
+  if (!res.ok) {
+    $<HTMLParagraphElement>('#aboutUpdate').textContent = `读不到版本信息：${res.error}`;
+    return;
+  }
+  const a = res.data;
+  $<HTMLSpanElement>('#aboutVersion').textContent = `v${a.version}`;
+  $<HTMLElement>('#aboutVersionCode').textContent = a.version;
+  $<HTMLParagraphElement>('#aboutDesc').textContent = a.description;
+  const repo = $<HTMLButtonElement>('#aboutRepo');
+  // 显示去掉协议头的短地址，点击才去开浏览器
+  repo.textContent = a.repo.replace(/^https?:\/\//i, '');
+  repo.title = `在浏览器中打开 ${a.repo}`;
+  repo.onclick = () => void window.tf?.openExternal(a.repo);
+}
+
+$<HTMLButtonElement>('#aboutCheck').addEventListener('click', async () => {
+  const btn = $<HTMLButtonElement>('#aboutCheck');
+  const line = $<HTMLParagraphElement>('#aboutUpdate');
+  if (!window.tf) {
+    line.className = 'hint warn';
+    line.textContent = '请在 Electron 中运行：pnpm start';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '查询中…';
+  line.className = 'hint';
+  line.textContent = '正在向 GitHub 查询最新版本…';
+
+  const res = await window.tf.checkUpdate();
+  btn.disabled = false;
+  btn.textContent = '检查新版本';
+  line.textContent = '';
+
+  if (!res.ok) {
+    line.className = 'hint warn';
+    line.textContent = `检查失败：${res.error}`;
+    return;
+  }
+  const u = res.data;
+  line.className = 'hint';
+  if (!u.latest) {
+    line.textContent = `已是最新版本（v${u.current}）。仓库还没发布过版本标签。`;
+    return;
+  }
+  if (!u.hasUpdate) {
+    // 远端比本地旧也算「已是最新」：本地可能是自己编的开发版
+    line.textContent = `已是最新版本（当前 v${u.current}，远端 v${u.latest}）。`;
+    return;
+  }
+  const where = u.source === 'tag' ? '标签' : '发版';
+  line.append(`发现新版本 v${u.latest}（当前 v${u.current}，来自 GitHub ${where}）。`);
+  if (u.url) {
+    const go = el('button', 'about-go');
+    go.textContent = '去看看';
+    go.onclick = () => void window.tf?.openExternal(u.url as string);
+    line.appendChild(go);
+  }
 });
 
 /* ---------------- 对话渲染 ---------------- */
@@ -519,13 +649,12 @@ function renderHistory(task: Task | null): void {
     if (!bot) continue;
 
     const turn = el('div', 'turn turn-bot');
-    // 思考过程只属于最后一轮：每次对话都会覆盖 task.reasoning / task.steps
+    // 过程只属于最后一轮：每次对话都会覆盖 task.process（以及兼容用的 reasoning / steps）
     const isLast = i + 1 === history.length - 1 && !live;
-    if (isLast && task?.reasoning) turn.appendChild(reasoningBlock(task.reasoning, 'past'));
-    if (isLast) {
-      const traces: LiveTrace[] = (task?.steps || []).map((s) => ({ name: s.name, args: s.args, ok: s.ok, ms: s.ms, t0: 0 }));
-      // 回放出来的工具调用一律收起：历史记录里再摆一排徽章最占地方
-      if (traces.length) turn.appendChild(traceGroup(traces, 0, null));
+    if (isLast && task) {
+      // 过程默认收起，明面上只留最后那句总结；想看它当时怎么想的，点开就是原顺序
+      const proc = taskProcess(task);
+      if (proc.length) turn.appendChild(processBlock(proc));
     }
     const body = el('div', 'msg-bot md');
     body.innerHTML = bot.content ? markdownToHtml(bot.content) : '（没有输出）';
@@ -541,6 +670,127 @@ function renderHistory(task: Task | null): void {
     startTicker();
   }
   scrollBottom();
+}
+
+/**
+ * 把落盘的片段还原成可渲染的片段。
+ *
+ * 老任务只存了「一整坨思考 + 一串工具」，没有交错顺序；那就思考在前、工具在后，
+ * 至少还看得见当时想了什么、调了什么，不至于因为缺 process 字段就一片空白。
+ */
+function taskProcess(task: Task): SavedSegment[] {
+  if (Array.isArray(task.process)) return task.process;
+  const out: SavedSegment[] = [];
+  if (task.reasoning) out.push({ kind: 'reasoning', text: task.reasoning });
+  for (const s of task.steps || []) out.push({ kind: 'tool', name: s.name, args: s.args, ok: s.ok, ms: s.ms });
+  return out;
+}
+
+/**
+ * 最后一段文字是不是就是那句最终总结。
+ *
+ * 流式过程中最终回答也是逐片拼进 segments 的，落盘时得把它从过程里剔掉——
+ * 否则总结会在「任务过程」和正文里各出现一遍。留个宽松比对：流式碎片与后端给的
+ * 最终文本偶尔差一两个字符，只要一方是另一方的开头就认定是同一条。
+ */
+function isFinalAnswer(text: string, answer: string): boolean {
+  const a = text.trim();
+  const b = answer.trim();
+  if (!a || !b) return false;
+  return a === b || b.startsWith(a) || a.startsWith(b);
+}
+
+/**
+ * 一轮结束：把整条过程序列（连同兼容用的老字段）写回任务。
+ *
+ * `answer` 是后端给的最终回答，也是 history 里存的那一条；它自己会画成正片，
+ * 所以要从过程里剔掉。
+ */
+function persistProcess(task: Task, live: LiveRun | null, answer: string): void {
+  const raw: Segment[] = live ? [...live.segments] : [];
+  // 尾部空白文字段没有信息量，留着只会在过程里空一行
+  let keep = raw.length;
+  while (keep > 0) {
+    const seg = raw[keep - 1];
+    if (seg.kind === 'text' && !seg.text.trim()) keep--;
+    else break;
+  }
+  raw.length = keep;
+  const tail = raw[raw.length - 1];
+  if (tail && tail.kind === 'text' && isFinalAnswer(tail.text, answer)) raw.pop();
+
+  const segs: SavedSegment[] = [];
+  for (const s of raw) {
+    if (s.kind === 'reasoning') segs.push({ kind: 'reasoning', text: s.text });
+    else if (s.kind === 'text') segs.push({ kind: 'text', text: s.text });
+    else segs.push({ kind: 'tool', name: s.trace.name, args: s.trace.args, ok: s.trace.ok, ms: s.trace.ms });
+  }
+  task.process = segs;
+  // 老字段继续写：旧版本界面、以及已经躺在别处的旧逻辑只认这两个
+  task.reasoning =
+    segs
+      .filter((s): s is { kind: 'reasoning'; text: string } => s.kind === 'reasoning')
+      .map((s) => s.text)
+      .join('\n\n') || undefined;
+  task.steps = segs
+    .filter((s): s is { kind: 'tool'; name: string; args: string; ok?: boolean; ms?: number } => s.kind === 'tool')
+    .map((s) => ({ name: s.name, args: s.args, ok: s.ok, ms: s.ms }));
+}
+
+/**
+ * 任务过程块：一轮结束后，把「最终总结」之外的一切（思考、工具、中间那几句交代）
+ * 收进一个默认折叠的 <details>。
+ *
+ * 用户要的是先看见结论，过程想看再点开——所以默认收起，但一个字不删：
+ * 展开后仍按当时的顺序排，里面的思考块各自还能再折一层。
+ * 摘要里带上件数与耗时，收起状态也不丢信息。
+ */
+function processBlock(segs: SavedSegment[]): HTMLElement {
+  const think = segs.filter((s) => s.kind === 'reasoning').length;
+  const tools = segs.filter(
+    (s): s is { kind: 'tool'; name: string; args: string; ok?: boolean; ms?: number } => s.kind === 'tool'
+  );
+  const failed = tools.filter((t) => t.ok === false).length;
+  const total = tools.reduce((n, t) => n + (t.ms || 0), 0);
+
+  const box = el('details', 'process');
+  // 默认收起：总结已经写在下面，过程是「想深究再看」的东西
+  box.open = false;
+  const sum = el('summary');
+  const bits: string[] = [];
+  if (think) bits.push(`思考 ${think} 段`);
+  if (tools.length) bits.push(`${tools.length} 件工具${total ? ` · 合计 ${fmtElapsed(total)}` : ''}`);
+  if (failed) bits.push(`${failed} 件失败`);
+  sum.textContent = bits.length ? `任务过程 · ${bits.join(' · ')}` : '任务过程';
+  box.appendChild(sum);
+
+  const body = el('div', 'process-body');
+  let gid = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    if (seg.kind === 'reasoning') {
+      body.appendChild(reasoningBlock(seg.text, 'past'));
+      continue;
+    }
+    if (seg.kind === 'text') {
+      if (!seg.text.trim()) continue;
+      const bubble = el('div', 'msg-bot md process-text');
+      bubble.innerHTML = markdownToHtml(seg.text);
+      body.appendChild(bubble);
+      continue;
+    }
+    // 连着调的一串工具并回一组，和跑着的时候保持一致
+    const traces: LiveTrace[] = [];
+    while (i < segs.length && segs[i].kind === 'tool') {
+      const t = segs[i] as { kind: 'tool'; name: string; args: string; ok?: boolean; ms?: number };
+      traces.push({ name: t.name, args: t.args, ok: t.ok, ms: t.ms, t0: 0 });
+      i++;
+    }
+    i--; // 上面的 while 多走了一步，退回外层循环的下一格
+    body.appendChild(traceGroup(traces, gid++, null));
+  }
+  box.appendChild(body);
+  return box;
 }
 
 /** 单个工具徽章：填充扫过 + 计时，结束转绿或抖动变红。移植自 ReactBits Call Chip */
@@ -598,16 +848,15 @@ function traceGroup(traces: LiveTrace[], gid: number, live: LiveRun | null): HTM
 }
 
 /**
- * 重画前把用户手动开合过的工具组记下来。
- * 和自动默认值一致说明他没动过，就别存成意图——否则该自动收起的那组永远收不起来。
+ * 重画前把用户手动开合过的块记下来（工具组与思考块共用这一套）。
+ * 和自动默认值一致说明他没动过，就别存成意图——否则该自动收起的那块永远收不起来。
  */
-function rememberTraceOpen(old: HTMLElement): void {
-  if (!liveRun) return;
-  old.querySelectorAll<HTMLDetailsElement>('details.trace-group').forEach((d) => {
-    const gid = Number(d.dataset.g);
-    if (!Number.isFinite(gid)) return;
-    if (d.open === (d.dataset.auto === '1')) liveRun!.traceOpen.delete(gid);
-    else liveRun!.traceOpen.set(gid, d.open);
+function rememberOpen(old: HTMLElement, selector: string, attr: string, store: Map<number, boolean>): void {
+  old.querySelectorAll<HTMLDetailsElement>(selector).forEach((d) => {
+    const key = Number(d.dataset[attr]);
+    if (!Number.isFinite(key)) return;
+    if (d.open === (d.dataset.auto === '1')) store.delete(key);
+    else store.set(key, d.open);
   });
 }
 
@@ -626,18 +875,22 @@ const REASONING_LABEL: Record<ReasoningState, string> = {
 };
 
 /**
- * 思考块：模型吐出的 reasoning 内容，默认折叠。
+ * 思考块：模型这一步吐出的 reasoning 内容，可折叠。
  *
  * 推理模型的思考链动辄几千字，全展开会把正片挤走；但用户又想看它怎么想的，
- * 所以做成默认收起、点开可读。<details> 省掉一堆开合状态管理。
+ * 所以默认收起、点开可读。<details> 省掉一堆开合状态管理。
  *
- * 标签随状态走：想的时候是「思考中…」，一想完立刻翻成「思考完成」。
- * 别等整轮结束才变——否则用户以为它还在想，其实早就在调工具了。
+ * 默认开合跟着状态走：还在想就展开（得看见它在动脑），想完/回放一律收起。
+ * `seg` 是这段思考在 segments 里的下标，给了才有「用户手动开过」的记忆。
  */
-function reasoningBlock(text: string, state: ReasoningState): HTMLElement {
+function reasoningBlock(text: string, state: ReasoningState, seg = -1, live: LiveRun | null = null): HTMLElement {
   const box = el('details', `reasoning${state === 'done' ? ' done' : ''}`);
-  // 还在跑的时候先展开，让用户看到「它在想」；跑完收起，别占地方
-  box.open = state !== 'past';
+  const auto = state === 'thinking';
+  box.open = (seg >= 0 ? live?.reasonOpen.get(seg) : undefined) ?? auto;
+  if (seg >= 0) {
+    box.dataset.seg = String(seg);
+    box.dataset.auto = auto ? '1' : '0';
+  }
   const sum = el('summary');
   sum.textContent = REASONING_LABEL[state];
   const body = el('div', 'reasoning-body');
@@ -648,21 +901,21 @@ function reasoningBlock(text: string, state: ReasoningState): HTMLElement {
 
 /**
  * 按 liveRun 的数据把「正在跑的这一轮」搭出来。
- * 片段按模型产出顺序穿插：文字段与工具段交错，和真实对话流一致。
+ * 片段按模型产出顺序穿插：思考、正文、工具交替出现，和真实对话流一致。
  */
 function buildLiveTurn(live: LiveRun): HTMLElement {
   const turn = el('div', 'turn turn-bot live-turn');
 
-  // 想完了就写「思考完成」，别等整轮结束（结束态由 'past' 负责）
-  if (live.reasoning) {
-    turn.appendChild(reasoningBlock(live.reasoning, live.reasoningDone ? 'done' : 'thinking'));
-  }
-
   // 连着调的几件工具合成一组（组序号用来记住用户手动开合过的意思）
   let gid = 0;
   for (let i = 0; i < live.segments.length; i++) {
-    if (live.segments[i].kind === 'text') {
-      const seg = live.segments[i] as { kind: 'text'; text: string };
+    const seg = live.segments[i];
+    if (seg.kind === 'reasoning') {
+      // 思考画在它自己那一格：这一步想的，就贴在这一步前面
+      turn.appendChild(reasoningBlock(seg.text, seg.done ? 'done' : 'thinking', i, live));
+      continue;
+    }
+    if (seg.kind === 'text') {
       const bubble = el('div', 'msg-bot md');
       if (seg.text) bubble.innerHTML = markdownToHtml(seg.text);
       turn.appendChild(bubble);
@@ -677,16 +930,17 @@ function buildLiveTurn(live: LiveRun): HTMLElement {
     turn.appendChild(traceGroup(traces, gid++, live));
   }
 
-  // 最后一段还是工具（或压根没有文字），就补一个等待态，否则会出现「只有徽章没有文字」的空档
   const last = live.segments[live.segments.length - 1];
-  if (!last || last.kind === 'tool') {
-    const bubble = el('div', 'msg-bot md typing');
-    bubble.appendChild(thinkingBlock(live.thinking));
-    turn.appendChild(bubble);
-  } else {
+  if (last && last.kind === 'text') {
     // 最后一段是文字：挂上打字光标，表示还可能继续来
     const bubbles = turn.querySelectorAll<HTMLElement>('.msg-bot');
     bubbles[bubbles.length - 1]?.classList.add('streaming');
+  } else if (!(last && last.kind === 'reasoning' && !last.done)) {
+    // 不是「正在想」也不是「正在写」，就补一个等待态：
+    // 否则界面上只剩徽章或一段已经收起的思考，看着像卡住了
+    const bubble = el('div', 'msg-bot md typing');
+    bubble.appendChild(thinkingBlock(live.thinking));
+    turn.appendChild(bubble);
   }
   return turn;
 }
@@ -746,11 +1000,11 @@ async function refresh(): Promise<void> {
     brokenList.appendChild(row);
   }
 
-  const shown = s.tools.filter((x) => x.status !== 'pending' && x.status !== 'rejected');
-  const list = $<HTMLDivElement>('#toolList');
-  list.innerHTML = '';
-  for (const t of shown) list.appendChild(toolRow(t));
-  $<HTMLElement>('#toolEmpty').hidden = shown.length > 0;
+  // 仓库列表交给筛选区来渲染：等级 tab 与搜索词都是模块状态，
+  // 开关、删除、放行后重新 refresh 时筛选条件不能自己弹回去
+  lastTools = s.tools.filter((x) => x.status !== 'pending' && x.status !== 'rejected');
+  renderToolFilter();
+  renderToolList();
 }
 
 /** 运行环境一行：沙箱到底有没有 OS 级隔离，不能靠默认值猜 */
@@ -791,6 +1045,96 @@ function renderWorkspace(ws: TaskWorkspace): void {
   name.textContent = workspaceLabel(ws);
   chip.title =
     ws && ws !== 'general' ? `${ws}\n点击选择文件夹` : ws === 'general' ? '通用工作区：不绑定文件夹' : '本任务还没选工作区';
+}
+
+/* ---------------- 工具仓库筛选：等级 tab + 名称搜索 ---------------- */
+
+/** 等级顺序与 review.ts 的定级一致：L0 最安全，L3 最危险 */
+const TRUST_ORDER = ['L0', 'L1', 'L2', 'L3'];
+/** 只写 L0/L1 谁也记不住差在哪，定级说明放 tab 的 title 里 */
+const TRUST_HINT: Record<string, string> = {
+  all: '所有等级的工具',
+  L0: 'L0 无权限：不碰网络、不碰文件',
+  L1: 'L1 只读：只读网络 / 只读文件 / 沙箱内跑代码',
+  L2: 'L2 有写或有密钥',
+  L3: 'L3 可执行命令或命中高危，需人工放行',
+};
+
+/** 最近一次取回的仓库列表，筛选在本地做，不必回头再问主进程 */
+let lastTools: ToolSummary[] = [];
+/** 当前选中的等级 tab，'all' 表示全部 */
+let trustFilter = 'all';
+/** 名称搜索词，空串表示不过滤 */
+let toolQuery = '';
+
+function renderToolFilter(): void {
+  const tabs = $<HTMLDivElement>('#toolTabs');
+  const counts = new Map<string, number>();
+  for (const t of lastTools) counts.set(t.trust, (counts.get(t.trust) || 0) + 1);
+  // 选中的等级被删空了就回退「全部」，否则列表一直空着，看着像工具丢了
+  if (trustFilter !== 'all' && !counts.has(trustFilter)) trustFilter = 'all';
+
+  tabs.innerHTML = '';
+  const add = (key: string, count: number): void => {
+    const on = key === trustFilter;
+    const btn = el('button', `tool-tab${on ? ' active' : ''}${key === 'all' ? '' : ` ${key}`}`);
+    btn.type = 'button';
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-selected', String(on));
+    btn.title = TRUST_HINT[key] || key;
+    const label = el('span');
+    label.textContent = key === 'all' ? '全部' : key;
+    const num = el('span', 'tool-tab-count');
+    num.textContent = String(count);
+    btn.append(label, num);
+    btn.onclick = () => {
+      trustFilter = key;
+      renderToolFilter();
+      renderToolList();
+    };
+    tabs.appendChild(btn);
+  };
+
+  add('all', lastTools.length);
+  for (const level of TRUST_ORDER) {
+    const n = counts.get(level) || 0;
+    // 空等级不给 tab：点进去只能看见「没有工具」，白占一行
+    if (n) add(level, n);
+  }
+  // 四级之外的等级（tool.json 被手改过才会出现）也要留入口，否则只能在「全部」里翻
+  for (const level of [...counts.keys()].filter((k) => !TRUST_ORDER.includes(k)).sort()) {
+    add(level, counts.get(level) || 0);
+  }
+}
+
+/** 按当前 tab + 搜索词渲染仓库列表；tab 管等级，搜索词只比工具名 */
+function renderToolList(): void {
+  const q = toolQuery.trim().toLowerCase();
+  const rows = lastTools.filter(
+    (t) => (trustFilter === 'all' || t.trust === trustFilter) && (!q || t.name.toLowerCase().includes(q))
+  );
+
+  const list = $<HTMLDivElement>('#toolList');
+  list.innerHTML = '';
+  for (const t of rows) list.appendChild(toolRow(t));
+
+  const empty = $<HTMLElement>('#toolEmpty');
+  empty.hidden = rows.length > 0;
+  if (rows.length) return;
+  // 「筛没了」和「本来就没有」要分开说，不然用户会以为工具被删了
+  const scope = trustFilter === 'all' ? '' : `${trustFilter} 等级下`;
+  if (!lastTools.length) empty.textContent = '仓库里还没有工具。';
+  else if (q) empty.textContent = `${scope}没有名字含「${toolQuery.trim()}」的工具。`;
+  else empty.textContent = `${scope}还没有工具。`;
+}
+
+// 搜索框常驻在设置页骨架里，事件只在启动时绑一次
+const toolSearchBox = $<HTMLInputElement>('#toolSearch');
+if (toolSearchBox) {
+  toolSearchBox.addEventListener('input', () => {
+    toolQuery = toolSearchBox.value;
+    renderToolList();
+  });
 }
 
 function toolRow(t: ToolSummary): HTMLElement {
@@ -1271,7 +1615,7 @@ function forceFinish(taskId: string, message: string): void {
       { role: 'assistant', content: answer || `（${message}）` }
     );
     task.history = task.history.slice(-8);
-    if (liveRun.reasoning) task.reasoning = liveRun.reasoning;
+    persistProcess(task, liveRun, answer);
   }
   clearWatchdog();
   stopTicker();
@@ -1315,10 +1659,9 @@ async function send(text: string): Promise<void> {
     taskId: task.id,
     pendingInput: text,
     thinking: '思考中…',
-    reasoning: '',
-    reasoningDone: false,
     segments: [],
     traceOpen: new Map(),
+    reasonOpen: new Map(),
     started: Date.now(),
   };
   inner.appendChild(buildLiveTurn(liveRun));
@@ -1349,15 +1692,18 @@ async function send(text: string): Promise<void> {
     failed = (err as Error).message;
   }
 
+  // 事件走的是 IPC 的另一条通道，可能比 chat() 的返回值晚一拍进渲染层。
+  // 收尾前先让出一个宏任务，把还在队列里的事件处理完——否则这一轮最后一步的
+  // 思考与正文会赶在 liveRun 清空之后才到，被 `if (!liveRun) return` 直接丢掉
+  // （多步任务里丢的总是最后一步，正是要收进「任务过程」的那一段）。
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
   // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失
   const answer = streamed || (aborted ? '（已暂停）' : '');
   task.history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
   task.history = task.history.slice(-8);
-  // 思考过程与工具轨迹一起留在任务上，重开也能看
-  if (liveRun?.reasoning) task.reasoning = liveRun.reasoning;
-  task.steps = [...(liveRun?.segments || [])]
-    .filter((s): s is { kind: 'tool'; trace: LiveTrace } => s.kind === 'tool')
-    .map((s) => ({ name: s.trace.name, args: s.trace.args, ok: s.trace.ok, ms: s.trace.ms }));
+  // 整条过程（思考 / 中间正文 / 工具，按真实顺序）一起留在任务上，重开也能按原位看
+  persistProcess(task, liveRun, answer);
 
   clearWatchdog();
   stopTicker();
@@ -1423,21 +1769,32 @@ document.querySelectorAll<HTMLButtonElement>('.tab').forEach((tab) => {
   tab.addEventListener('click', () => setPhase((tab.dataset.phase as 'work' | 'create') || 'work'));
 });
 
-$<HTMLButtonElement>('#newTaskBtn').addEventListener('click', () => {
+/**
+ * 开一条新任务，并把工作区预置成 `ws`。
+ *
+ * 任务记录要等第一条消息才建（见 ensureTask），所以这里准备的是「草稿工作区」：
+ * 输入框上方的 chip 显示它，发第一句话时固化进新任务。
+ *
+ * 侧栏分组头的「＋」和顶部的「＋ 新任务」只差这一个参数：
+ * 前者带上该分组的工作区，后者是 null —— 真正的空白起点。
+ */
+function newTaskIn(ws: TaskWorkspace): void {
   activeId = null;
-  // 新任务必须是彻底空白的：工作区、选中态、对话、输入框残留、滚动位置全清
-  draftWorkspace = null;
+  // 对话、选中态、输入框残留、滚动位置一并清掉，新任务必须是彻底空白的
+  draftWorkspace = ws;
   const input = $<HTMLTextAreaElement>('#input');
   input.value = '';
   growInput(input);
-  renderWorkspace(null);
+  renderWorkspace(ws);
   renderTasks();
   renderHistory(null);
   showView('chat');
   chat.scrollTop = 0;
   input.focus();
   saveTasks();
-});
+}
+
+$<HTMLButtonElement>('#newTaskBtn').addEventListener('click', () => newTaskIn(null));
 
 $<HTMLButtonElement>('#importBtn').addEventListener('click', async () => {
   const res = await window.tf?.importPack();
@@ -1583,15 +1940,19 @@ if (window.tf) {
     const onScreen = activeId === liveRun.taskId;
 
     if (event.type === 'reasoning' && event.reasoning) {
-      liveRun.reasoning += event.reasoning;
-      // 又在吐思考了（多半是下一步）：标签翻回「思考中…」
-      setReasoningDone(false, onScreen);
+      // 思考落在它自己的位置：还在想的那段就接着写，已经收尾了就另起一段
+      const open = openReasoning(liveRun);
+      if (open) open.text += event.reasoning;
+      else liveRun.segments.push({ kind: 'reasoning', text: event.reasoning, done: false });
       if (!onScreen) return;
-      // 思考块是纯文本累积，直接改文本比整轮重画便宜得多
-      const box = inner.querySelector<HTMLDetailsElement>('.live-turn .reasoning');
-      if (box) {
+      const idx = liveRun.segments.length - 1;
+      const seg = liveRun.segments[idx];
+      // 屏幕上最后那个思考块正是这一段时，直接改文本比整轮重画便宜得多；
+      // 不是（这段还没画出来）就重画一次把它挂上去
+      const box = inner.querySelector<HTMLDetailsElement>('.live-turn details.reasoning:last-of-type');
+      if (box && box.dataset.seg === String(idx) && seg.kind === 'reasoning') {
         const body = box.querySelector('.reasoning-body');
-        if (body) body.textContent = liveRun.reasoning;
+        if (body) body.textContent = seg.text;
       } else if (inner.querySelector('.live-turn')) {
         paintAll();
       }
@@ -1599,8 +1960,8 @@ if (window.tf) {
     }
 
     if (event.type === 'tool_call') {
-      // 开始调工具 = 刚才那段思考已经收尾
-      setReasoningDone(true, onScreen);
+      // 开始调工具 = 刚才那段思考已经收尾（下次重画时它会自己收起来）
+      sealReasoning(liveRun);
       liveRun.segments.push({
         kind: 'tool',
         trace: { name: event.name || '', args: shorten(JSON.stringify(event.args || {}), 90), t0: Date.now() },
@@ -1632,14 +1993,14 @@ if (window.tf) {
     }
 
     if (event.type === 'assistant') {
-      // 这一步的正文已经吐完，思考早就结束了；兜个底，免得只走非流式时标签赖在「思考中…」
-      setReasoningDone(true, onScreen);
+      // 这一步的正文已经吐完，思考早就结束了；兜个底，免得只走非流式时那段思考一直挂着「思考中…」
+      sealReasoning(liveRun);
       return;
     }
 
     if (event.type === 'delta' && event.delta) {
-      // 开始吐正文，说明思考收尾了——用户等着看的是这一句，不是那句「思考中…」
-      setReasoningDone(true, onScreen);
+      // 开始吐正文，说明这一步想完了——用户等着看的是这一句，不是那句「思考中…」
+      sealReasoning(liveRun);
       const last = liveRun.segments[liveRun.segments.length - 1];
       if (last && last.kind === 'text') last.text += event.delta;
       else liveRun.segments.push({ kind: 'text', text: event.delta });
@@ -1649,23 +2010,21 @@ if (window.tf) {
   });
 }
 
+/** 还在想的那一段思考（只会是最后一段）。返回它本身，好让调用方往里续写 */
+function openReasoning(live: LiveRun): { kind: 'reasoning'; text: string; done: boolean } | null {
+  const last = live.segments[live.segments.length - 1];
+  return last && last.kind === 'reasoning' && !last.done ? last : null;
+}
+
 /**
- * 翻思考块的标签：thinking↔done。
+ * 这一步想完了：模型开始吐正文或调工具，思考段就地收尾。
  *
- * 「想完了」这件事不必等整轮结束——模型开始吐正文或调工具时就已经成立。
- * 只改 summary 的文案和 done 类，不整轮重画：这一步可能反复发生（多步任务每步都想一次），
- * 重画会把用户正在读的内容抖一下。切到别的任务时只记账、不碰 DOM，
- * 因为此刻页面上的节点不属于这一轮。
+ * 只改数据、不碰 DOM：紧接着的那次重画会把它从「思考中…」翻成「思考完成」并自动收起。
+ * 别在这里另写一份 DOM 操作——一份状态两处更新，迟早对不上。
  */
-function setReasoningDone(done: boolean, onScreen: boolean): void {
-  if (!liveRun || liveRun.reasoningDone === done) return;
-  liveRun.reasoningDone = done;
-  if (!onScreen) return;
-  const box = inner.querySelector<HTMLDetailsElement>('.live-turn .reasoning');
-  if (!box) return; // 思考块还没画出来（比如这一轮压根没思考），下次重画自然带上
-  box.classList.toggle('done', done);
-  const sum = box.querySelector('summary');
-  if (sum) sum.textContent = done ? REASONING_LABEL.done : REASONING_LABEL.thinking;
+function sealReasoning(live: LiveRun): void {
+  const last = live.segments[live.segments.length - 1];
+  if (last && last.kind === 'reasoning') last.done = true;
 }
 
 /** 把当前开着的文字段封口，让下一段文字另起一个气泡 */
@@ -1684,13 +2043,10 @@ function sealTextSegment(): void {
 function paintAll(): void {
   const old = inner.querySelector<HTMLElement>('.live-turn');
   if (!old || !liveRun) return;
-  // 保留用户手动展开/收起思考块与工具组的意图
-  const wasOpen = old.querySelector<HTMLDetailsElement>('.reasoning')?.open;
-  rememberTraceOpen(old);
-  const fresh = buildLiveTurn(liveRun);
-  const box = fresh.querySelector<HTMLDetailsElement>('.reasoning');
-  if (box && wasOpen !== undefined) box.open = wasOpen;
-  old.replaceWith(fresh);
+  // 保留用户手动展开/收起思考块与工具组的意图（每个块各自一份记忆）
+  rememberOpen(old, 'details.trace-group', 'g', liveRun.traceOpen);
+  rememberOpen(old, 'details.reasoning[data-seg]', 'seg', liveRun.reasonOpen);
+  old.replaceWith(buildLiveTurn(liveRun));
   scrollBottom();
 }
 

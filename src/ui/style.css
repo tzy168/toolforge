@@ -39,15 +39,27 @@ body {
 
 /* ---------- 任务侧栏 ---------- */
 .side {
+  position: relative;
   width: 240px;
   flex: 0 0 240px;
   border-right: 1px solid var(--line);
-  background: var(--panel);
+  /* 底色上压两团极淡的极光：红、绿各一点，正好是品牌仅有的两个点缀色 */
+  background-color: var(--panel);
+  background-image:
+    radial-gradient(320px 220px at 12% -4%, rgba(200, 16, 46, 0.055), transparent 72%),
+    radial-gradient(300px 200px at 96% 4%, rgba(47, 122, 79, 0.05), transparent 74%);
+  background-repeat: no-repeat;
   display: flex;
   flex-direction: column;
   padding: 14px 0 40px;
   overflow: hidden;
   transition: width 0.16s ease, flex-basis 0.16s ease;
+  /* 动的是 background-position：只重绘不重排，比动 transform 一个伪元素省心 */
+  animation: side-aurora 18s ease-in-out infinite alternate;
+}
+@keyframes side-aurora {
+  from { background-position: 0 0, 0 0; }
+  to { background-position: 22px 14px, -18px 10px; }
 }
 /* 收起后只剩窗口左边缘的一条细栏，点 ☰ 再展开 */
 .side.collapsed {
@@ -64,7 +76,29 @@ body {
   padding: 0 16px 12px 16px;
   flex: 0 0 auto;
 }
-.side-brand { font-size: var(--fs-lg); font-weight: var(--fw-medium); letter-spacing: 0.2px; white-space: nowrap; }
+.side-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+/* 品牌标记：一个慢慢转 90° 的小方块，比静止的圆点多点「正在锻造」的意思 */
+.side-brand::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: linear-gradient(135deg, var(--ink), #8b8b82);
+  box-shadow: 0 0 0 3px rgba(23, 23, 26, 0.06);
+  animation: brand-turn 4.2s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+@keyframes brand-turn {
+  0%, 40% { transform: rotate(0deg) scale(1); }
+  70%, 100% { transform: rotate(90deg) scale(1.08); }
+}
 
 .icon-btn {
   font-family: inherit;
@@ -83,7 +117,10 @@ body {
 }
 .icon-btn:hover { color: var(--ink); border-color: var(--line); background: #fff; }
 
+/* 新任务升成侧栏唯一的实心主按钮：深色渐变 + 浮起 + 一道光扫过 */
 .new-task {
+  position: relative;
+  overflow: hidden;
   margin: 0 12px 10px;
   flex: 0 0 auto;
   font-family: inherit;
@@ -91,63 +128,162 @@ body {
   font-weight: var(--fw-medium);
   text-align: left;
   padding: 9px 11px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: #fff;
-  color: var(--ink);
+  border: 1px solid var(--ink);
+  border-radius: 8px;
+  background: linear-gradient(180deg, #2a2a2f, var(--ink));
+  color: #fff;
   cursor: pointer;
+  box-shadow: 0 1px 2px rgba(23, 23, 26, 0.2);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.2s ease;
 }
-.new-task:hover { border-color: var(--faint); }
+.new-task:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px -8px rgba(23, 23, 26, 0.55);
+}
+.new-task:active {
+  transform: translateY(0) scale(0.988);
+  box-shadow: 0 1px 2px rgba(23, 23, 26, 0.2);
+}
+/* 高光带只在 hover 时扫一次，不做常驻循环——侧栏里常驻动画一多就闹 */
+.new-task::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 36%, rgba(255, 255, 255, 0.42) 50%, transparent 64%);
+  transform: translateX(-130%);
+  pointer-events: none;
+}
+.new-task:hover::after { animation: side-sweep 0.75s cubic-bezier(0.4, 0, 0.2, 1); }
+@keyframes side-sweep {
+  from { transform: translateX(-130%); }
+  to { transform: translateX(130%); }
+}
 
 .task-list { flex: 1; overflow-y: auto; padding: 0 8px; }
+/* 侧栏的滚动条平时透明，指针进到列表里才浮出来，少点视觉噪音 */
+.task-list::-webkit-scrollbar { width: 8px; }
+.task-list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.task-list:hover::-webkit-scrollbar-thumb { background: #dedcd4; background-clip: content-box; }
+/* 错峰入场只由 renderTasks 挂一次 .enter：之后每次点任务都会重建整列，
+   若每回都重放动画，侧栏会随每次切换抖一下 */
+.task-list.enter > * {
+  animation: side-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: calc(var(--i, 0) * 26ms);
+}
+@keyframes side-in {
+  from { opacity: 0; transform: translateY(7px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
 
 .task {
+  position: relative;
+  /* 扫光带要能被圆角裁掉，不然会溢出到相邻行 */
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px;
-  border-radius: 7px;
+  /* 左侧多让 4px 给指示条，文字才不会和它贴上 */
+  padding: 8px 8px 8px 12px;
+  border-radius: 8px;
   font-size: var(--fs-sm);
   color: var(--muted);
   cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease,
+    transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
 }
-.task:hover { background: #f1f0ec; }
-.task.active { background: #eceae4; color: var(--ink); font-weight: var(--fw-medium); }
-.task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 左侧指示条：hover 只伸出一小截，选中才拉满——层级一眼能分出来 */
+.task::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 3px;
+  height: 16px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #c9c7bf, #dedcd4);
+  opacity: 0;
+  transform: translateY(-50%) scaleY(0.2);
+  transition: opacity 0.16s ease, transform 0.26s cubic-bezier(0.22, 1, 0.36, 1),
+    background 0.18s ease;
+  pointer-events: none;
+}
+/* 指针掠过时一道白光扫过行背景。纯装饰，所以关掉命中检测 */
+.task::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 38%, rgba(255, 255, 255, 0.7) 50%, transparent 62%);
+  transform: translateX(-120%);
+  pointer-events: none;
+}
+.task:hover { background: #f1f0ec; color: var(--ink); transform: translateX(2px); }
+.task:hover::before { opacity: 0.85; transform: translateY(-50%) scaleY(0.55); }
+.task:hover::after { animation: side-sweep 0.6s ease; }
+.task.active {
+  background: linear-gradient(100deg, #efece4, #e7e4db);
+  color: var(--ink);
+  font-weight: var(--fw-medium);
+  box-shadow: inset 0 0 0 1px rgba(23, 23, 26, 0.05), 0 1px 2px rgba(23, 23, 26, 0.05);
+}
+.task.active::before {
+  opacity: 1;
+  transform: translateY(-50%) scaleY(1);
+  background: linear-gradient(180deg, var(--ink), #6b6b63);
+}
+.task-title { position: relative; z-index: 1; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-del {
+  position: relative;
+  z-index: 1;
   flex: 0 0 auto;
   font-family: inherit;
   font-size: var(--fs-xs);
+  line-height: 1;
+  padding: 2px 3px;
   color: var(--faint);
   background: transparent;
   border: none;
+  border-radius: 5px;
   cursor: pointer;
   opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.14s ease, transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+    color 0.14s ease;
 }
-.task:hover .task-del { opacity: 1; }
-.task-del:hover { color: var(--red); }
+/* 删除键平时不占视线，hover 才弹出来；自己再 hover 转个 90° 提示「要删了」 */
+.task:hover .task-del { opacity: 1; transform: none; }
+.task-del:hover { color: var(--red); transform: rotate(90deg) scale(1.1); }
 
-.side-empty { padding: 10px 16px; font-size: var(--fs-sm); color: var(--faint); line-height: 1.6; }
+.side-empty { padding: 10px 16px; font-size: var(--fs-sm); color: var(--faint); line-height: 1.6; animation: side-in 0.3s ease backwards; }
 
 /* ---------- 侧栏按工作区分组 ---------- */
 .group-head {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 5px;
   padding: 9px 8px 5px;
+  border-radius: 7px;
   font-size: var(--fs-xs);
   color: var(--muted);
   cursor: pointer;
   user-select: none;
   min-width: 0;
+  transition: background 0.15s ease, color 0.15s ease;
 }
-.group-head:hover { color: var(--ink); }
+.group-head:hover { color: var(--ink); background: #f4f3ef; }
+/* caret 用带回弹的曲线转，折叠/展开有个小顿挫，比线性更像「按下去」了 */
 .group-caret {
   flex: 0 0 auto;
   font-size: 9px;
   opacity: 0.6;
-  transition: transform 0.14s;
+  transition: transform 0.24s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.15s ease;
 }
+.group-head:hover .group-caret { opacity: 1; }
 .group-head.collapsed .group-caret { transform: rotate(-90deg); }
 .group-name {
   flex: 1;
@@ -158,7 +294,41 @@ body {
   font-weight: var(--fw-medium);
   letter-spacing: 0.2px;
 }
-.group-count { flex: 0 0 auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+/* 计数做成小胶囊，指针落到分组头上时填充变实心，比纯数字更有分量 */
+.group-count {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: #eceae4;
+  color: var(--faint);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.group-head:hover .group-count { background: #e2e0d6; color: var(--ink); }
+/* 分组上的「＋」：直接在这个工作区里开一条新任务。
+   平时藏起来，鼠标落到分组头上才露——不然每行都挂个加号，侧栏看着像工具栏。 */
+.group-add {
+  flex: 0 0 auto;
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1;
+  padding: 1px 3px;
+  color: var(--faint);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.14s ease, transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+    background 0.12s ease, color 0.12s ease;
+}
+.group-head:hover .group-add { opacity: 1; transform: none; }
+.group-add:hover { color: var(--ink); background: #eceae4; }
 
 /* ---------- 主区 ---------- */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -338,6 +508,61 @@ body {
 
 .row { display: flex; gap: 8px; margin-bottom: 10px; }
 
+/* ---------- 关于 ---------- */
+.about-brand { display: flex; gap: 13px; align-items: flex-start; }
+.about-mark {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 19px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.about-meta { min-width: 0; }
+.about-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.2px;
+}
+.about-ver { font-family: ui-monospace, monospace; font-size: var(--fs-xs); color: var(--faint); font-weight: var(--fw-normal); }
+.about-desc { margin-top: 5px; font-size: var(--fs-sm); color: var(--muted); line-height: 1.7; }
+.repo-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  font-family: ui-monospace, monospace;
+  font-size: var(--fs-sm);
+  padding: 7px 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.repo-link:hover { color: var(--ink); border-color: var(--faint); }
+/* 检查更新后冒出来的「去下载」，跟正文一起读得下去，不用当按钮看 */
+.about-go {
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  margin-left: 6px;
+  padding: 0 1px;
+  color: var(--ink);
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--faint);
+  cursor: pointer;
+}
+.about-go:hover { border-color: var(--ink); }
+
 .ghost {
   font-size: var(--fs-sm);
   font-family: inherit;
@@ -418,6 +643,65 @@ body {
   background: #fff;
 }
 .field input:focus { border-color: var(--faint); }
+
+/* ---------- 仓库筛选：等级 tab + 名称搜索 ---------- */
+.tool-filter { display: flex; align-items: center; gap: 8px; margin: 12px 0 2px; flex-wrap: wrap; }
+/* 横向 tab 用分段控件的样子，比一排下划线好点：等级之间是并列关系，不是导航 */
+.tool-tabs {
+  display: flex;
+  gap: 2px;
+  flex: 0 1 auto;
+  max-width: 100%;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tool-tabs::-webkit-scrollbar { display: none; }
+.tool-tab {
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.12s, color 0.12s;
+}
+.tool-tab:hover { background: #f1f0ec; color: var(--ink); }
+.tool-tab.active { background: #fff; color: var(--ink); font-weight: var(--fw-medium); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06); }
+.tool-tab-count {
+  font-family: ui-monospace, monospace;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.tool-tab.active .tool-tab-count { color: var(--muted); }
+/* 数量沿用 chip 的红/黄，扫一眼就知道这个等级里有多少危险货 */
+.tool-tab.L3 .tool-tab-count { color: var(--red); }
+.tool-tab.L2 .tool-tab-count { color: #9a6b1f; }
+
+.tool-search {
+  flex: 1 1 150px;
+  min-width: 120px;
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  background: #fff;
+  color: var(--ink);
+}
+.tool-search:focus { border-color: var(--faint); }
+.tool-search::placeholder { color: var(--faint); }
 
 /* ---------- 工具卡 ---------- */
 .tool {
@@ -836,6 +1120,42 @@ body {
   opacity: 0.9;
 }
 
+/* ---------- 任务过程（一轮结束后收起，明面上只留最终总结）---------- */
+/* 和思考块、工具组共用「竖线 + 三角」的视觉语言；收起时只占一行摘要 */
+.process {
+  margin: 0 0 12px;
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  align-self: flex-start;
+  max-width: 100%;
+}
+.process > summary {
+  font-size: var(--fs-xs);
+  font-family: ui-monospace, monospace;
+  color: var(--faint);
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+  list-style: none;
+}
+.process > summary::-webkit-details-marker { display: none; }
+.process > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 5px;
+  font-size: 9px;
+  transition: transform 0.14s;
+}
+.process[open] > summary::before { transform: rotate(90deg); }
+.process > summary:hover { color: var(--muted); }
+.process-body { padding-top: 4px; }
+/* 过程里的正文是当时的中间交代，比正片轻一档，别抢总结的戏 */
+.process-body .msg-bot {
+  font-size: 0.94em;
+  opacity: 0.86;
+  margin-bottom: 8px;
+}
+
 /* ---------- 工具调用徽章（移植自 ReactBits Call Chip）---------- */
 /* 填充从左侧扫过，时长未知时用慢速脉冲兜底；结束转绿或抖动变红 */
 .call-chip {
@@ -1029,7 +1349,19 @@ body {
   .hero,
   .hero-sub,
   .hero-mark,
-  .hero-ch { animation: none !important; }
+  .hero-ch,
+  .side,
+  .side-brand::before,
+  .task-list.enter > *,
+  .side-empty { animation: none !important; }
+  /* 扫光的两条伪元素留在起点，动画一关它们就只是块看不见的板子，直接不画 */
+  .new-task::after,
+  .task::after { display: none; }
+  /* 指示条与删除键的位移一并归零，只留静态状态色 */
+  .task::before,
+  .task-del,
+  .group-add,
+  .group-caret { transition: none; }
   /* 逐字符入场被关掉后，字母必须显式回到实色——否则停在 from 帧的透明态 */
   .hero-ch {
     opacity: 1;

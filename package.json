@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "创建你自己的 Agent —— 一切皆 Tool 的桌面端 Agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tzy168/toolforge.git"
+  },
+  "homepage": "https://github.com/tzy168/toolforge",
   "main": "dist/electron/main.cjs",
   "packageManager": "pnpm@11.21.0",
   "scripts": {
@@ -13,7 +18,8 @@
     "cli": "pnpm build && node dist/bin/cli.js",
     "test": "pnpm build && node --test dist/test/loop.test.js",
     "selftest": "pnpm build && node dist/bin/cli.js --selftest",
-    "verify:switch": "pnpm build && node scripts/verify-switch.mjs"
+    "verify:switch": "pnpm build && node scripts/verify-switch.mjs",
+    "verify:toolfilter": "pnpm build && node scripts/verify-toolfilter.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1",

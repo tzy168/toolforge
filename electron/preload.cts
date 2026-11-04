@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld('tf', {
   openWorkspace: (dir: string) => ipcRenderer.invoke('tf:openWorkspace', dir),
   exportPack: (payload: unknown) => ipcRenderer.invoke('tf:exportPack', payload),
   importPack: () => ipcRenderer.invoke('tf:importPack'),
+  // 关于页：版本/简介/仓库地址 + 检查更新 + 开外链（都走主进程，渲染层不碰网络与 shell）
+  about: () => ipcRenderer.invoke('tf:about'),
+  checkUpdate: () => ipcRenderer.invoke('tf:checkUpdate'),
+  openExternal: (url: string) => ipcRenderer.invoke('tf:openExternal', url),
   onEvent: (cb: (event: unknown) => void) => {
     ipcRenderer.on('tf:event', (_e, data) => cb(data));
   },

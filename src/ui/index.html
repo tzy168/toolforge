@@ -82,6 +82,7 @@
           <nav class="settings-nav">
             <button class="nav-item active" data-pane="tools">工具</button>
             <button class="nav-item" data-pane="model">模型</button>
+            <button class="nav-item" data-pane="about">关于</button>
           </nav>
 
           <div class="settings-panes">
@@ -100,6 +101,19 @@
                   <button id="exportBtn" class="ghost">导出全部</button>
                 </div>
                 <div id="brokenList"></div>
+                <!-- 等级 tab 由 app.ts 按实际存在的等级生成，别在这里写死 -->
+                <div class="tool-filter">
+                  <div class="tool-tabs" id="toolTabs" role="tablist" aria-label="按等级筛选工具"></div>
+                  <input
+                    id="toolSearch"
+                    type="search"
+                    class="tool-search"
+                    placeholder="按名称搜索工具"
+                    autocomplete="off"
+                    spellcheck="false"
+                    aria-label="按名称搜索工具"
+                  />
+                </div>
                 <div id="toolList"></div>
                 <p class="hint empty-hint" id="toolEmpty" hidden>仓库里还没有工具。</p>
               </div>
@@ -154,6 +168,34 @@
                   API Key 只存在主进程，写入 <code>~/.toolforge/settings.json</code>，界面不会回显。<br />
                   当前生效：<span id="statusLine"></span>
                 </p>
+              </div>
+            </div>
+
+            <!-- 关于：版本与地址都以 package.json 为准，界面只负责显示 -->
+            <div class="pane" data-pane="about" hidden>
+              <div class="group about-card">
+                <div class="about-brand">
+                  <div class="about-mark" aria-hidden="true">⚒</div>
+                  <div class="about-meta">
+                    <div class="about-name">ToolForge<span id="aboutVersion" class="about-ver"></span></div>
+                    <p class="about-desc" id="aboutDesc"></p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="group">
+                <h3>项目主页</h3>
+                <p class="hint">源码、更新日志与问题反馈都在这里：</p>
+                <button id="aboutRepo" class="repo-link" title="在浏览器中打开"></button>
+              </div>
+
+              <div class="group">
+                <h3>版本</h3>
+                <p class="hint">当前版本 <code id="aboutVersionCode">—</code></p>
+                <div class="row">
+                  <button id="aboutCheck" class="ghost solid">检查新版本</button>
+                </div>
+                <p class="hint" id="aboutUpdate">还没检查过。检查会向 GitHub 查询最新的发版或标签。</p>
               </div>
             </div>
           </div>
