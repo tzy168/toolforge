@@ -1,5 +1,7 @@
 node_modules/
 dist/
+release/
+.pack-cache/
 src/ui/build/
 .shot.png
 .env

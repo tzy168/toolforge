@@ -1,8 +1,10 @@
 // 工具规格：整个系统的地基。规格定歪了，后面全歪。
 import type {
+  DepRecord,
   JsonSchema,
   Permissions,
   Tool,
+  ToolDeps,
   ToolExample,
   ToolImpl,
   ToolKind,
@@ -82,6 +84,29 @@ function normalizeExamples(raw: unknown): ToolExample[] {
 }
 
 /**
+ * 校准依赖安装记录。它是「机器实测」的产物而不是用户声明，缺字段就当没记过，
+ * 不要因为一份旧记录格式对不上就把整件工具判成损坏。
+ */
+function normalizeDepRecord(raw: unknown): DepRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Partial<DepRecord>;
+  if (typeof r.at !== 'string' || !Array.isArray(r.packages)) return null;
+  return {
+    at: r.at,
+    manager: typeof r.manager === 'string' ? r.manager : 'unknown',
+    packages: r.packages
+      .filter((p): p is DepRecord['packages'][number] => Boolean(p) && typeof p === 'object' && typeof p.name === 'string')
+      .map((p) => ({
+        name: p.name,
+        version: String(p.version ?? ''),
+        integrity: typeof p.integrity === 'string' ? p.integrity : null,
+      })),
+    totalBytes: Number(r.totalBytes) || 0,
+    transitiveCount: Number(r.transitiveCount) || 0,
+  };
+}
+
+/**
  * 把任意输入捏成规范的工具对象。不改原对象，返回新对象。
  * 不合规时抛错，错误信息直接回灌给模型，便于它自己改。
  */
@@ -121,6 +146,8 @@ export function normalizeTool(raw: RawTool = {}): Tool {
     lastRun: raw.meta?.lastRun ?? null,
   };
   if (raw.meta?.review) meta.review = raw.meta.review;
+  const depRecord = normalizeDepRecord(raw.meta?.deps);
+  if (depRecord) meta.deps = depRecord;
 
   return {
     id: raw.id || name,
@@ -139,8 +166,55 @@ export function normalizeTool(raw: RawTool = {}): Tool {
   };
 }
 
+/** 直接依赖数量上限。超过这个量级说明该换 MCP 了，沙箱装不下也不该装 */
+export const MAX_DEPS = 20;
+
+// npm 包名：允许 @scope/name，全小写，不允许路径符号
+const DEP_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+// 精确版本：1.2.3，可带预发布/构建后缀。不含任何范围符号
+const DEP_EXACT_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+/**
+ * 校验依赖声明。这里挡掉的每一类都是「装的时候看着没事、两年后害人」的东西：
+ * 范围版本（不可复现）、git/file 协议（可指向任意代码）、超大依赖集（供应链面爆炸）。
+ */
+export function normalizeDeps(raw: unknown): ToolDeps {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('deps 不合规：须为 {包名: "精确版本"} 对象，如 {"dayjs": "1.11.13"}');
+  }
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length > MAX_DEPS) {
+    throw new Error(
+      `deps 过多：最多 ${MAX_DEPS} 个直接依赖（现声明 ${entries.length}）。更重的依赖请改走 MCP 服务器，别塞进沙箱`
+    );
+  }
+  const out: ToolDeps = {};
+  for (const [name, ver] of entries) {
+    const n = String(name).trim();
+    if (!DEP_NAME_RE.test(n)) {
+      throw new Error(`deps 包名不合规：${name}（须为合法 npm 包名，允许 @scope/name；不允许路径或 git 地址）`);
+    }
+    const v = String(ver ?? '').trim();
+    if (!DEP_EXACT_RE.test(v)) {
+      throw new Error(
+        `deps 版本必须精确：${n} 声明的是 "${v}"。只接受 1.2.3 这种确切版本，` +
+          '不接受 ^ / ~ / * / latest / git: / file: / http:——否则同一件工具以后装出来是另一份代码，审计结论失效'
+      );
+    }
+    out[n] = v;
+  }
+  return out;
+}
+
 function normalizeImpl(kind: ToolKind, impl: ToolImpl | undefined, name = ''): ToolImpl {
   const i: ToolImpl = impl && typeof impl === 'object' ? impl : {};
+  // 依赖只在沙箱子进程里能被 require 到；别的 kind 声明它只会让人误以为装得上
+  if (kind !== 'script' && i.deps && Object.keys(i.deps).length > 0) {
+    throw new Error(
+      `kind=${kind} 不支持 impl.deps：只有 script 类工具能声明三方依赖（http/transform/shell/compose 由宿主直接执行，没有 node_modules 可 require）`
+    );
+  }
   switch (kind) {
     case 'http': {
       if (!i.url) throw new Error('http 工具缺少 impl.url');
@@ -173,6 +247,8 @@ function normalizeImpl(kind: ToolKind, impl: ToolImpl | undefined, name = ''): T
       return {
         entry: `${name || 'tool'}.cjs`,
         code: typeof i.code === 'string' ? i.code : null,
+        // 依赖声明落在 impl 里，会随 tool.json 一起持久化，导出 pack 时也要带上
+        deps: normalizeDeps(i.deps),
         timeoutMs: Number(i.timeoutMs) || 30000,
       };
     }

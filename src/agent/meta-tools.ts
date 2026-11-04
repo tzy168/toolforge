@@ -7,6 +7,8 @@ import * as audit from '../core/audit.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { dirs, toolDir } from '../core/paths.js';
+import { installToolDeps, planSharedDeps, toDepRecord, type DepInstallReport } from '../core/deps.js';
+import { sharedDepsRoot } from '../core/appPaths.js';
 import type { Json, JsonSchema, Tool, ToolImpl, ToolResult, Permissions } from '../types.js';
 
 // 元工具：Agent 用来「看仓库、找工具、造工具」的那几件。
@@ -35,6 +37,12 @@ const createToolSchema: JsonSchema = {
     kind: { type: 'string', enum: ['http', 'transform', 'compose', 'script', 'shell'], description: '实现方式，声明式优先' },
     input: { type: 'object', description: '入参的 JSON Schema，通常 {type:"object",properties:{...},required:[...]}' },
     code: { type: 'string', description: 'kind=transform 或 script 时的实现代码' },
+    deps: {
+      type: 'object',
+      description:
+        'kind=script 专用：三方依赖，包名 → 精确版本，如 {"dayjs":"1.11.13"}。只收精确版本（不收 ^ ~ * latest / git: / file:）。不在本机离线白名单里的依赖装不上，会转人工。',
+      additionalProperties: { type: 'string' },
+    },
     http: {
       type: 'object',
       description: 'kind=http 时的配置',
@@ -289,7 +297,9 @@ function buildImpl(args: Json): ToolImpl {
     case 'transform':
       return { code: String(args.code ?? '') };
     case 'script':
-      return { code: String(args.code ?? '') };
+      // deps 只从 script 透传。其它 kind 声明依赖会被 normalizeTool 直接拒掉，
+      // 这里提前带上只会把那个错误盖住，让人以为是别的地方出了问题。
+      return { code: String(args.code ?? ''), ...(args.deps ? { deps: args.deps as ToolImpl['deps'] } : {}) };
     case 'compose':
       return { steps: (args.steps as ToolImpl['steps']) || [] };
     case 'shell':
@@ -326,7 +336,63 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
   const code = tool.impl.code ?? '';
   const findings = code ? staticScan(code) : [];
 
-  // 2) 跑自带用例
+  // 2) 依赖闸门。这里的顺序是整件事的关键：跑用例就是在执行代码，
+  //    所以「先装依赖 → 再跑用例 → 最后请示」是错的，那等于让一份没过审的
+  //    外部代码先在本机执行了一遍，然后再去问用户同不同意。
+  //    白名单外的依赖一律不装、不跑，直接转人工。
+  const depNames = Object.keys(tool.impl.deps ?? {});
+  const depPlan = depNames.length ? planSharedDeps(tool) : null;
+  const depsBlocked = depNames.length > 0 && (!depPlan || depPlan.missing.length > 0);
+  if (depsBlocked) {
+    const missing = depPlan ? depPlan.missing : depNames;
+    const reasons = [`依赖 ${missing.length} 个白名单外的三方包（${missing.join(', ')}）：未安装、未跑用例，等人工决定`];
+    if (!depPlan) reasons.push('本机没有离线白名单目录，离线安装这条路在当前形态下不可用');
+    store.patch(tool.id, {
+      status: 'pending',
+      trust: 'L3',
+      meta: { review: { at: new Date().toISOString(), level: 'L3', reasons, findings, tests: [] } },
+    });
+    audit.append({
+      type: 'review',
+      tool: tool.name,
+      trust: 'L3',
+      status: 'pending',
+      testsOk: false,
+      needsHuman: true,
+      findings: findings.length,
+    });
+    return JSON.stringify({
+      ok: false,
+      stage: 'deps',
+      tool: { id: tool.id, name: tool.name, kind: tool.kind, trust: 'L3', status: 'pending' },
+      deps: { declared: tool.impl.deps, missing, sharedDepsRoot: sharedDepsRoot() },
+      review: { level: 'L3', needsHuman: true, reasons, findings },
+      hint:
+        '这些依赖不在本机离线白名单里，所以既没安装也没跑用例。可选：把包加进 shared-deps.json 后重新打包；换一个不依赖它们的实现；或由用户人工放行后再联网安装。',
+    });
+  }
+
+  // 3) 装依赖。白名单内是纯文件复制，不联网、不跑任何 install 脚本
+  let depReport: DepInstallReport | null = null;
+  if (depNames.length) {
+    try {
+      depReport = await installToolDeps(tool);
+      store.patch(tool.id, { meta: { deps: toDepRecord(depReport) } });
+    } catch (err) {
+      const message = (err as Error).message;
+      store.patch(tool.id, { status: 'pending' });
+      audit.append({ type: 'create_tool', stage: 'deps', ok: false, error: message, tool: tool.name });
+      return JSON.stringify({
+        ok: false,
+        stage: 'deps',
+        error: message,
+        hint: '依赖没装上，工具已落为 pending。把 deps 改成精确版本（如 "1.2.3"）后重新调 create_tool。',
+      });
+    }
+  }
+
+  // 4) 跑自带用例。必须在依赖就位之后——否则 require 一上来就失败，
+  //    那种失败骗人，会让人以为代码写错了
   const runner = async (t: Tool, a: Json): Promise<unknown> => {
     const r = await executeTool(t, a, { sessionId: ctx.sessionId, runner: ctx.runTool });
     if (!r.ok) throw new Error(r.error);
@@ -368,6 +434,19 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
     tests: { passed: tests.ok, details: tests.results },
     review: { level: g.level, needsHuman: g.needsHuman, reasons: g.reasons, findings },
   };
+
+  // 装了什么、多大、多少个传递依赖，一并回给模型：它下次要判断「这个库是不是太重了」
+  // 时，只能靠这些数字，不能靠猜
+  if (depReport) {
+    payload.deps = {
+      manager: depReport.manager,
+      skipped: depReport.skipped,
+      ms: depReport.ms,
+      packages: depReport.installed,
+      totalBytes: depReport.totalBytes,
+      transitiveCount: depReport.transitiveCount,
+    };
+  }
 
   if (!tests.ok) {
     payload.stage = 'test';

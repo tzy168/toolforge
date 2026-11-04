@@ -22,6 +22,36 @@ export interface ToolExample {
   expect?: string | null;
 }
 
+/**
+ * 三方依赖声明：包名 → 精确版本号。
+ *
+ * 必须精确（1.2.3），不接受 ^ / ~ / * / latest / git: / file:。
+ * 理由：同一件工具半年后重装，装出来的必须是同一份代码。范围版本会让
+ * 「当时审过的实现」和「现在跑的实现」悄悄变成两个东西，审计结论随之失效。
+ */
+export type ToolDeps = Record<string, string>;
+
+/** 实际装进来的一个包 */
+export interface InstalledDep {
+  name: string;
+  version: string;
+  /** 来自 lockfile 的 SRI，用于复现校验；取不到时为 null */
+  integrity: string | null;
+}
+
+/** 落盘的依赖安装记录，写进 ToolMeta.deps，供审核面板与审计使用 */
+export interface DepRecord {
+  at: string;
+  /** 用的哪个包管理器装的，如 npm@10.8.2 */
+  manager: string;
+  /** 声明的直接依赖（含解析后的确切版本） */
+  packages: InstalledDep[];
+  /** node_modules 总字节数 */
+  totalBytes: number;
+  /** 传递依赖包数，用来兜住「一个包拖进两百个包」的情况 */
+  transitiveCount: number;
+}
+
 /** 各 kind 的实现字段都塞这里，字段按 kind 取用 */
 export interface ToolImpl {
   // http
@@ -43,6 +73,8 @@ export interface ToolImpl {
   // mcp
   server?: string;
   remoteName?: string;
+  // script 专用：三方依赖声明，包名 → 精确版本。其它 kind 声明了会被 reject
+  deps?: ToolDeps;
   // 公用
   timeoutMs?: number;
 }
@@ -85,6 +117,8 @@ export interface ToolMeta {
   updatedAt: string;
   lastRun?: LastRun | null;
   review?: ReviewRecord;
+  /** 依赖安装记录。只有真的装过才有；声明了依赖但没装（待审）时为空 */
+  deps?: DepRecord;
 }
 
 export interface Tool {

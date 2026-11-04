@@ -117,7 +117,14 @@ export class ToolStore {
       if (persisted.impl?.code) {
         fs.writeFileSync(path.join(dir, entry), persisted.impl.code, 'utf8');
       }
-      persisted.impl = { entry, timeoutMs: persisted.impl?.timeoutMs };
+      // 依赖声明必须跟着 tool.json 走：worker 重启后要靠它判断「装没装、装的是哪版」。
+      // 早先这里只留 entry/timeoutMs，任何新增的 impl 字段都会被静默丢掉。
+      const deps = persisted.impl?.deps;
+      persisted.impl = {
+        entry,
+        timeoutMs: persisted.impl?.timeoutMs,
+        ...(deps && Object.keys(deps).length ? { deps } : {}),
+      };
     }
     fs.writeFileSync(file, JSON.stringify(persisted, null, 2), 'utf8');
     this.invalidate();

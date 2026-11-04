@@ -258,6 +258,27 @@ ipcMain.handle(
 
 app.whenReady().then(async () => {
   await boot();
+  // 打包自检：验证「双击图标启动」这条路上，随包 npm 与随包依赖是否真的可用。
+  // 必须跑在 createWindow 之前：自检不弹窗口，也不该被界面加载的任何异常干扰。
+  // 输出走 console.log 是可行的——被父进程 spawn 并接管管道时，GUI 子系统同样能写到
+  // stdout（项目里 [smoke] 那套已经在用这条路）。
+  if (process.env.TF_PACK_SELFTEST) {
+    try {
+      const { runPackSelfTest } = await import('../src/core/packSelfTest.js');
+      const report = await runPackSelfTest({
+        depName: process.env.TF_SELFTEST_DEP,
+        depVersion: process.env.TF_SELFTEST_VERSION,
+        keepDir: Boolean(process.env.TF_SELFTEST_KEEP),
+      });
+      console.log(`[pack-selftest] ${JSON.stringify(report)}`);
+      if (report.error) process.exitCode = 1;
+    } catch (err) {
+      console.log(`[pack-selftest] ${JSON.stringify({ error: (err as Error).message })}`);
+      process.exitCode = 1;
+    }
+    app.quit();
+    return;
+  }
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
