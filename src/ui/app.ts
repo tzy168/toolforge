@@ -63,7 +63,12 @@ interface EventPayload {
 
 interface Bridge {
   state: () => Promise<Envelope<ForgeState>>;
-  chat: (payload: { input: string; phase: string; history: Array<{ role: string; content: string }> }) => Promise<Envelope<{ reply: string }>>;
+  chat: (payload: {
+    input: string;
+    phase: string;
+    history: Array<{ role: string; content: string }>;
+    workspace?: string | null;
+  }) => Promise<Envelope<{ reply: string }>>;
   approve: (id: string) => Promise<Envelope<unknown>>;
   reject: (id: string) => Promise<Envelope<unknown>>;
   remove: (id: string) => Promise<Envelope<unknown>>;
@@ -73,9 +78,9 @@ interface Bridge {
   setActiveProvider: (id: string | null) => Promise<Envelope<unknown>>;
   listProviderModels: (p: { id: string; baseURL?: string; apiKey?: string }) => Promise<Envelope<string[]>>;
   openHome: () => Promise<Envelope<unknown>>;
-  pickWorkspace: () => Promise<Envelope<ForgeState>>;
-  clearWorkspace: () => Promise<Envelope<ForgeState>>;
-  openWorkspace: () => Promise<Envelope<unknown>>;
+  /** 只弹目录选择器，不改全局状态——每个任务各选各的 */
+  pickFolder: () => Promise<Envelope<{ canceled: boolean; path?: string }>>;
+  openWorkspace: (dir: string) => Promise<Envelope<unknown>>;
   exportPack: (payload: { name: string; ids: string[] }) => Promise<Envelope<{ canceled: boolean; path?: string; count?: number }>>;
   importPack: () => Promise<Envelope<{ canceled: boolean; results?: Array<{ ok: boolean; skipped?: string; error?: string }> }>>;
   onEvent: (cb: (event: EventPayload) => void) => void;
@@ -106,8 +111,22 @@ let lastTraceItem: { item: HTMLElement; detail: HTMLElement; state: HTMLElement 
 let streamBuffer = '';
 // 流式片段按帧合并：每片都重新解析 Markdown 是 O(n²)，一屏的量级也够卡
 let renderQueued = false;
+/**
+ * 「还没发出第一条消息」时的草稿工作区。
+ * 没有活动任务时由它显示在 chip 上；发出第一条消息时固化进任务。
+ * 新点「新任务」会重置为 null —— 那才是真正的空白。
+ */
+let draftWorkspace: TaskWorkspace = null;
 
 /* ---------------- 任务（每段对话一条记录） ---------------- */
+
+/**
+ * 一个任务的工作区。
+ * - 字符串：具体文件夹的绝对路径
+ * - `'general'`：通用工作区，用来做不需要碰某个项目的活儿
+ * - `null`：还没选（新任务默认就是它）
+ */
+type TaskWorkspace = string | 'general' | null;
 
 interface Task {
   id: string;
@@ -115,9 +134,17 @@ interface Task {
   phase: 'work' | 'create';
   history: Array<{ role: string; content: string }>;
   at: number;
+  /** 老数据没有这个字段，读出来是 undefined，按"未选"处理 */
+  workspace?: TaskWorkspace;
 }
 
 const TASK_KEY = 'toolforge.tasks';
+/** 侧栏分组折叠状态按工作区记住，键是工作区标识 */
+const GROUP_KEY = 'toolforge.groups';
+
+function taskWorkspace(t: Task): TaskWorkspace {
+  return t.workspace ?? null;
+}
 
 // 任务只是本地对话记录，存在渲染层即可，不进主进程仓库
 function loadTasks(): { tasks: Task[]; active: string | null } {
@@ -157,11 +184,45 @@ function ensureTask(firstMessage: string): Task {
     phase,
     history: [],
     at: Date.now(),
+    // 新任务继承输入框上方当前选中的工作区
+    workspace: draftWorkspace,
   };
   tasks.unshift(task);
   activeId = task.id;
   return task;
 }
+
+/** 工作区标识 → 给用户看的名字。'general' 与 null 都不指向具体文件夹 */
+function workspaceLabel(ws: TaskWorkspace): string {
+  if (ws === 'general') return '通用工作区';
+  if (!ws) return '未选择工作区';
+  const parts = ws.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || ws;
+}
+
+/** 侧栏分组键：同一个文件夹的任务归到一起 */
+function groupKey(ws: TaskWorkspace): string {
+  return ws ?? '__none__';
+}
+
+function loadGroups(): Record<string, boolean> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GROUP_KEY) || '{}');
+    return raw && typeof raw === 'object' ? (raw as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveGroups(): void {
+  try {
+    localStorage.setItem(GROUP_KEY, JSON.stringify(groups));
+  } catch {
+    /* 存不下不影响使用 */
+  }
+}
+
+let groups = loadGroups();
 
 function renderTasks(): void {
   const list = $<HTMLDivElement>('#taskList');
@@ -172,28 +233,71 @@ function renderTasks(): void {
     list.appendChild(tip);
     return;
   }
-  for (const task of tasks) {
-    const row = el('div', `task${task.id === activeId ? ' active' : ''}`);
-    row.title = task.title;
-    const title = el('span', 'task-title');
-    title.textContent = task.title;
-    const del = el('button', 'task-del');
-    del.textContent = '✕';
-    del.title = '删除任务';
-    del.onclick = (e) => {
-      e.stopPropagation();
-      tasks = tasks.filter((t) => t.id !== task.id);
-      if (activeId === task.id) {
-        activeId = tasks[0]?.id ?? null;
-        openTask(activeId);
-      }
-      saveTasks();
+
+  // 按工作区分组。文件夹之间按最近活动排序，未选/通用的排在后面——
+  // 具体项目通常更常用，先看到它们。
+  const order: string[] = [];
+  const byGroup = new Map<string, Task[]>();
+  for (const t of tasks) {
+    const k = groupKey(taskWorkspace(t));
+    if (!byGroup.has(k)) {
+      byGroup.set(k, []);
+      order.push(k);
+    }
+    byGroup.get(k)!.push(t);
+  }
+  order.sort((a, b) => {
+    const weight = (k: string) => (k === '__none__' ? 2 : k === 'general' ? 1 : 0);
+    return weight(a) - weight(b);
+  });
+
+  for (const key of order) {
+    const rows = byGroup.get(key)!;
+    const ws = rows[0] ? taskWorkspace(rows[0]) : null;
+    const collapsed = groups[key] === true;
+
+    const head = el('div', `group-head${collapsed ? ' collapsed' : ''}`);
+    head.title = ws && ws !== 'general' ? ws : workspaceLabel(ws);
+    const caret = el('span', 'group-caret');
+    caret.textContent = '▾';
+    const gname = el('span', 'group-name');
+    gname.textContent = workspaceLabel(ws);
+    const gcount = el('span', 'group-count');
+    gcount.textContent = String(rows.length);
+    head.append(caret, gname, gcount);
+    head.onclick = () => {
+      groups[key] = !collapsed;
+      saveGroups();
       renderTasks();
     };
-    row.append(title, del);
-    row.onclick = () => openTask(task.id);
-    list.appendChild(row);
+    list.appendChild(head);
+
+    if (collapsed) continue;
+    for (const task of rows) list.appendChild(taskRow(task));
   }
+}
+
+function taskRow(task: Task): HTMLElement {
+  const row = el('div', `task${task.id === activeId ? ' active' : ''}`);
+  row.title = task.title;
+  const title = el('span', 'task-title');
+  title.textContent = task.title;
+  const del = el('button', 'task-del');
+  del.textContent = '✕';
+  del.title = '删除任务';
+  del.onclick = (e) => {
+    e.stopPropagation();
+    tasks = tasks.filter((t) => t.id !== task.id);
+    if (activeId === task.id) {
+      activeId = null;
+      openTask(null);
+    }
+    saveTasks();
+    renderTasks();
+  };
+  row.append(title, del);
+  row.onclick = () => openTask(task.id);
+  return row;
 }
 
 /* ---------------- 视图切换 ---------------- */
@@ -253,7 +357,42 @@ const QUICK_STARTS = [
 function emptyState(): HTMLElement {
   const box = el('div', 'empty');
   box.id = 'empty';
-  box.innerHTML = '<h1>创建你自己的 Agent</h1><p>凡能力皆为工具。缺什么，让它现造一件。</p>';
+
+  // 口号拆成逐字符的 span，靠 CSS 变量错开延迟，做出「一格一格成形」的入场。
+  // 效果移植自 ReactBits 的 Split Text / Shiny Text / Blur Text，纯 CSS 实现。
+  const hero = el('h1', 'hero');
+  hero.setAttribute('aria-label', 'Forge what is missing');
+  // 读屏器读整句，视觉上是一堆 span 挨个亮起来，所以把碎片标成装饰
+  const frag = el('span', 'hero-frag');
+  frag.setAttribute('aria-hidden', 'true');
+  let seq = 0;
+  for (const word of ['Forge', 'what’s', 'missing.']) {
+    const w = el('span', 'hero-word');
+    // 关键词：整词一起承载光泽。逐字母各挂一条渐变会碎成噪点
+    if (seq === 0) {
+      w.classList.add('hero-key');
+      // 伪元素要高光层复刻文字，得把原文放进去
+      w.dataset.text = word;
+    }
+    for (const ch of word) {
+      const c = el('span', 'hero-ch');
+      c.textContent = ch;
+      c.style.setProperty('--i', String(seq++));
+      w.appendChild(c);
+    }
+    frag.appendChild(w);
+    // 词间补一个真实空格，保证复制出来的文本可读
+    frag.appendChild(document.createTextNode(' '));
+  }
+  hero.appendChild(frag);
+
+  const sub = el('p', 'hero-sub');
+  sub.append('凡能力皆为工具——没有现成的，就');
+  const mark = el('span', 'hero-mark');
+  mark.textContent = '当场造一件';
+  sub.append(mark, '。');
+
+  box.append(hero, sub);
   const grid = el('div', 'quick');
   for (const q of QUICK_STARTS) {
     const btn = el('button', 'quick-item');
@@ -323,8 +462,10 @@ function renderHistory(task: Task | null): void {
 function openTask(id: string | null): void {
   activeId = id;
   const task = currentTask();
-  // 每个任务记着自己的模式，切回来不用重选
+  // 每个任务记着自己的模式与工作区，切回来不用重选
   setPhase(task?.phase ?? 'work');
+  if (task) draftWorkspace = taskWorkspace(task);
+  renderWorkspace(task ? taskWorkspace(task) : draftWorkspace);
   renderTasks();
   renderHistory(task);
   showView('chat');
@@ -354,7 +495,6 @@ async function refresh(): Promise<void> {
 
   renderModels(s.models);
   renderRuntime(s);
-  renderWorkspace(s.workspace);
 
   const pendingList = $<HTMLDivElement>('#pendingList');
   pendingList.innerHTML = '';
@@ -406,21 +546,19 @@ function renderRuntime(s: ForgeState): void {
 }
 
 /**
- * 顶栏的工作目录。只显示路径最后一段（前面太长），完整路径放 title，
- * 点它弹系统目录选择器。
+ * 渲染输入框上方的工作区 chip。
+ *
+ * 显示的是「当前任务的工作区」；没有活动任务时显示草稿值（下一条任务会用这个）。
+ * 具体文件夹只显示最后一段，完整路径放 title。
  */
-function renderWorkspace(dir: string | null): void {
-  const btn = $<HTMLButtonElement>('#workspaceBtn');
-  const label = $<HTMLSpanElement>('#wsLabel');
-  btn.classList.toggle('unset', !dir);
-  if (dir) {
-    const parts = dir.split(/[\\/]/).filter(Boolean);
-    label.textContent = parts[parts.length - 1] || dir;
-    btn.title = `${dir}\n点击更换工作目录`;
-  } else {
-    label.textContent = '选择工作目录';
-    btn.title = 'Work 模式下 Agent 可以读写这个目录里的项目文件';
-  }
+function renderWorkspace(ws: TaskWorkspace): void {
+  const chip = $<HTMLButtonElement>('#wsPick');
+  const name = $<HTMLSpanElement>('#wsName');
+  chip.classList.toggle('unset', ws === null);
+  chip.classList.toggle('general', ws === 'general');
+  name.textContent = workspaceLabel(ws);
+  chip.title =
+    ws && ws !== 'general' ? `${ws}\n点击选择文件夹` : ws === 'general' ? '通用工作区：不绑定文件夹' : '本任务还没选工作区';
 }
 
 function toolRow(t: ToolSummary): HTMLElement {
@@ -882,7 +1020,13 @@ async function send(text: string): Promise<void> {
   const turn = currentTurn;
   let streamed = '';
   try {
-    const res = await window.tf.chat({ input: text, phase, history: task.history });
+    const res = await window.tf.chat({
+      input: text,
+      phase,
+      history: task.history,
+      // 'general' 与 null 对后端都意味着「不绑定目录」，具体路径才传下去
+      workspace: typeof task.workspace === 'string' ? task.workspace : null,
+    });
     bubble.classList.remove('typing', 'streaming');
     if (res.ok) {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
@@ -945,10 +1089,17 @@ document.querySelectorAll<HTMLButtonElement>('.tab').forEach((tab) => {
 
 $<HTMLButtonElement>('#newTaskBtn').addEventListener('click', () => {
   activeId = null;
+  // 新任务必须是彻底空白的：工作区、选中态、对话、输入框残留、滚动位置全清
+  draftWorkspace = null;
+  const input = $<HTMLTextAreaElement>('#input');
+  input.value = '';
+  growInput(input);
+  renderWorkspace(null);
   renderTasks();
   renderHistory(null);
   showView('chat');
-  $<HTMLTextAreaElement>('#input').focus();
+  chat.scrollTop = 0;
+  input.focus();
   saveTasks();
 });
 
@@ -984,19 +1135,83 @@ $<HTMLButtonElement>('#exportBtn').addEventListener('click', async () => {
 $<HTMLSpanElement>('#homePath').addEventListener('click', () => window.tf?.openHome());
 
 /* 工作目录：左键选目录，已选中时右键清除 */
-$<HTMLButtonElement>('#workspaceBtn').addEventListener('click', async () => {
-  const res = await window.tf?.pickWorkspace();
-  if (res && !res.ok) alert(res.error);
-  refresh();
+/* ---------------- 工作区选择器 ---------------- */
+
+const wsMenu = $<HTMLDivElement>('#wsMenu');
+const wsMenuBtn = $<HTMLButtonElement>('#wsMenuBtn');
+
+function setMenuOpen(open: boolean): void {
+  wsMenu.hidden = !open;
+  wsMenuBtn.setAttribute('aria-expanded', String(open));
+}
+
+wsMenuBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setMenuOpen(wsMenu.hidden);
 });
-$<HTMLButtonElement>('#workspaceBtn').addEventListener('contextmenu', async (e) => {
-  e.preventDefault();
-  const st = await window.tf?.state();
-  if (!st?.ok || !st.data.workspace) return;
-  if (!confirm(`清除工作目录？\n${st.data.workspace}`)) return;
-  const res = await window.tf?.clearWorkspace();
-  if (res && !res.ok) alert(res.error);
-  refresh();
+
+// 菜单内部的点击不要冒泡到 document，否则"点别处关闭"的逻辑会抢先把它关掉
+wsMenu.addEventListener('click', (e) => e.stopPropagation());
+
+// 点别处就收起，别让菜单挡着对话
+document.addEventListener('click', (e) => {
+  if (wsMenu.hidden) return;
+  if (wsMenu.contains(e.target as Node) || wsMenuBtn.contains(e.target as Node)) return;
+  setMenuOpen(false);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !wsMenu.hidden) setMenuOpen(false);
+});
+
+/**
+ * 改工作区：有活动任务就改任务本身；否则改草稿（等下一条任务用）。
+ * 两种情况都不动其它任务——每个任务的工作区互相独立。
+ */
+function applyWorkspace(ws: TaskWorkspace): void {
+  draftWorkspace = ws;
+  const task = currentTask();
+  if (task) task.workspace = ws;
+  saveTasks();
+  renderWorkspace(ws);
+  renderTasks();
+}
+
+wsMenu.addEventListener('click', async (e) => {
+  const opt = (e.target as HTMLElement).closest<HTMLElement>('.ws-option');
+  if (!opt) return;
+  const act = opt.dataset.act;
+  setMenuOpen(false);
+
+  if (act === 'general') {
+    applyWorkspace('general');
+    return;
+  }
+  if (act === 'clear') {
+    applyWorkspace(null);
+    return;
+  }
+  if (act === 'folder') {
+    const res = await window.tf?.pickFolder();
+    if (!res) return;
+    if (!res.ok) {
+      alert(res.error);
+      return;
+    }
+    if (res.data.canceled || !res.data.path) return;
+    applyWorkspace(res.data.path);
+  }
+});
+
+// 点 chip 本体 = 选文件夹，最常用的一步不必先开菜单
+$<HTMLButtonElement>('#wsPick').addEventListener('click', async () => {
+  const res = await window.tf?.pickFolder();
+  if (!res) return;
+  if (!res.ok) {
+    alert(res.error);
+    return;
+  }
+  if (res.data.canceled || !res.data.path) return;
+  applyWorkspace(res.data.path);
 });
 
 /* ---------------- 侧栏收放与设置页 ---------------- */
@@ -1059,9 +1274,10 @@ if (window.tf) {
 
 /* ---------------- 启动 ---------------- */
 
-if (!activeId && tasks.length) activeId = tasks[0].id;
-openTask(activeId);
+// 启动一律从空白工作区开始：新开窗口是为了干新活，不是接着上次的对话。
+// 历史任务仍在左栏里，点一下就回去。
+openTask(null);
 showView('chat');
 refresh();
 
-export {};
+export { };

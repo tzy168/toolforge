@@ -19,16 +19,11 @@
     </aside>
 
     <main class="main">
-      <button id="expandBtn" class="icon-btn expand-btn" title="展开侧栏">☰</button>
-
       <section class="view" id="viewChat">
         <header class="top">
-          <!-- 左侧是工作目录选择器；中间页签；右侧模型与工具数 -->
+          <!-- 左侧只留展开按钮（侧栏收起时出现），避免和中间页签抢位置 -->
           <div class="top-side">
-            <button id="workspaceBtn" class="ws-btn" title="选择工作目录">
-              <span class="ws-icon" aria-hidden="true">▸</span>
-              <span id="wsLabel" class="ws-label">选择工作目录</span>
-            </button>
+            <button id="expandBtn" class="icon-btn expand-btn" title="展开侧栏" hidden>☰</button>
           </div>
           <div class="tabs">
             <button class="tab active" data-phase="work">Work</button>
@@ -42,10 +37,35 @@
 
         <div class="chat" id="chat"></div>
 
-        <form class="composer" id="composer">
-          <textarea id="input" rows="1" placeholder="说说你要做什么…（Shift + Enter 换行）"></textarea>
-          <button type="submit" id="sendBtn">发送</button>
-        </form>
+        <div class="composer-wrap">
+          <!-- 工作区选择器：贴着输入框，因为它决定「这条任务在哪干活」 -->
+          <div class="ws-bar">
+            <button id="wsPick" class="ws-chip" title="选择一个文件夹作为工作区">
+              <span class="ws-chip-icon" aria-hidden="true">▸</span>
+              <span id="wsName" class="ws-chip-name">未选择工作区</span>
+            </button>
+            <button id="wsMenuBtn" class="ws-chip ws-chip-toggle" title="切换工作区" aria-haspopup="true" aria-expanded="false">▾</button>
+            <div id="wsMenu" class="ws-menu" hidden>
+              <button class="ws-option" data-act="general">
+                <span class="ws-opt-name">通用工作区</span>
+                <span class="ws-opt-desc">不绑定任何文件夹，适合纯计算、查资料这类活</span>
+              </button>
+              <button class="ws-option" data-act="folder">
+                <span class="ws-opt-name">选择文件夹…</span>
+                <span class="ws-opt-desc">让 Agent 能读写这个目录里的文件</span>
+              </button>
+              <button class="ws-option" data-act="clear">
+                <span class="ws-opt-name">不选（清空）</span>
+                <span class="ws-opt-desc">本任务暂时不碰文件</span>
+              </button>
+            </div>
+          </div>
+
+          <form class="composer" id="composer">
+            <textarea id="input" rows="1" placeholder="说说你要做什么…（Shift + Enter 换行）"></textarea>
+            <button type="submit" id="sendBtn">发送</button>
+          </form>
+        </div>
       </section>
 
       <!-- 设置是独立页面，不是浮层；侧栏在设置页里仍然可用 -->

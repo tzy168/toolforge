@@ -90,22 +90,19 @@ ipcMain.handle('tf:listProviderModels', guard((_e: unknown, p: unknown) => forge
 ipcMain.handle('tf:openHome', guard(() => shell.openPath(forge!.state().home)));
 
 // 选工作目录。渲染层拿不到 dialog，必须经主进程。
+// 只返回路径、不改全局状态：每个任务各存各的工作区，由渲染层决定用在哪条任务上。
 ipcMain.handle(
-  'tf:pickWorkspace',
+  'tf:pickFolder',
   guard(async () => {
     const pick = await dialog.showOpenDialog(win!, {
       title: '选择工作目录',
       properties: ['openDirectory', 'createDirectory'],
     });
-    if (pick.canceled || !pick.filePaths[0]) return forge!.state();
-    return forge!.setWorkspace(pick.filePaths[0]);
+    if (pick.canceled || !pick.filePaths[0]) return { canceled: true };
+    return { canceled: false, path: pick.filePaths[0] };
   })
 );
-ipcMain.handle('tf:clearWorkspace', guard(() => forge!.setWorkspace(null)));
-ipcMain.handle('tf:openWorkspace', guard(() => {
-  const ws = forge!.state().workspace;
-  return ws ? shell.openPath(ws) : '';
-}));
+ipcMain.handle('tf:openWorkspace', guard((_e: unknown, dir: string) => (dir ? shell.openPath(dir) : '')));
 
 ipcMain.handle(
   'tf:exportPack',

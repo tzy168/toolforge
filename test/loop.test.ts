@@ -400,6 +400,36 @@ test('沙箱：同时声明 ** 与 @workspace 时，两边的相对路径都能�
   assert.equal(out.tool?.status, 'active');
 });
 
+test('chat 逐轮传 workspace：每次都能覆盖全局状态，不同任务互不串味', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  const a = path.join(tmp, 'ws_a');
+  const b = path.join(tmp, 'ws_b');
+  fs.mkdirSync(a, { recursive: true });
+  fs.mkdirSync(b, { recursive: true });
+
+  // 不真的调模型：只验证 chat 开头的 workspace 落地逻辑，
+  // 所以塞一个会立刻抛错的假客户端，抛错前 workspace 已经被设置。
+  const probe = async (ws: string | null | undefined) => {
+    try {
+      await tf.chat({ input: 'x', workspace: ws, history: [] });
+    } catch {
+      /* 没配模型必然抛错，我们只关心 workspace 是否已生效 */
+    }
+    return getWorkspace();
+  };
+
+  // 具体目录 → 生效为绝对路径
+  assert.equal(await probe(a), path.resolve(a));
+  // 换一个目录 → 必须跟着换，不能留在上一次
+  assert.equal(await probe(b), path.resolve(b));
+  // 'general' 与 null 语义相同：不绑定目录
+  assert.equal(await probe(null), null);
+  assert.equal(await probe(a), path.resolve(a));
+  // undefined 表示沿用当前设置，不该被清空
+  assert.equal(await probe(undefined), path.resolve(a));
+});
+
 test('工作目录：只能存在真实目录，且 @workspace 权限只放行目录内的路径', async () => {
   const tf = new ToolForge();
   await tf.init({ connectMcp: false });

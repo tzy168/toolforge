@@ -80,7 +80,8 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 三层防线，都不完备，别宣传成「沙箱」：
 
 - **能力声明**：`permissions` 默认全空；域名白名单不支持 `*`；路径必须落在工具目录内。
-- **工作目录是独立的一层**：用户可在顶栏选一个项目目录，工具通过 `fsRead/fsWrite: ['@workspace']` 申请访问。它**不是**沙箱目录的放宽——只读 L1 自动放行、写入 L2 转人工，未选目录时工具会收到明确报错。宿主侧判定在 `permissions.pathAllowed`，子进程内在 `runtime-child.cts` 的 `guardFs`，两处都必须认 `@workspace`。
+- **工作目录是独立的一层**：用户可在输入框上方为**每个任务**选一个项目目录，工具通过 `fsRead/fsWrite: ['@workspace']` 申请访问。它**不是**沙箱目录的放宽——只读 L1 自动放行、写入 L2 转人工，未选目录时工具会收到明确报错。宿主侧判定在 `permissions.pathAllowed`，子进程内在 `runtime-child.cts` 的 `guardFs`，两处都必须认 `@workspace`。
+- **工作区按任务走，不是全局开关**：`chat()` 接受 `workspace` 参数并在每轮开头落地（`undefined` 表示沿用）。渲染层给每个任务存自己的 `workspace`（字符串 / `'general'` / `null`）。别改成只靠 `setWorkspaceDir` 这个全局状态——用户切任务太快时，异步往返会让工具拿到上一个任务的目录。
 - **`--allow-fs-*` 只给 `@workspace` 加**：工具目录与 `runtime-child.cjs` 是固定放行项。别把每条权限规则都塞进启动参数——`**` 或未创建的目录会解析成不存在的路径，Node 会直接 abort，把原本正常的工具一起弄崩（踩过）。
 - **相对路径的解析顺序**：先按默认根（读=工具目录 / 写=`.data`），若同时声明了 `@workspace` 再试工作目录，首个通过权限校验的胜出。这样工具既能读自己的数据，也能用 `'src/a.ts'` 这种自然写法指向项目文件。
 - **进程隔离**：脚本工具起子进程，优先用 Node 的 `--permission`（Node 22+）/ `--experimental-permission`（Node 20），逐个试探，都不行就**降级为无 OS 级隔离**（`permDisabled`），这是已知取舍。探测结果经 `permissionSupport()` 进 `ForgeState.sandbox`，设置页会如实显示；`probed: false` 表示本次启动还没跑过脚本工具，不能声称隔离已生效。

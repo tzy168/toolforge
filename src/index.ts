@@ -348,7 +348,26 @@ export class ToolForge {
     });
   }
 
-  async chat({ input, phase = 'work', history = [] }: { input: string; phase?: Phase; history?: ChatMessage[] }): Promise<ChatResult> {
+  /**
+   * 跑一轮对话。
+   *
+   * `workspace` 由调用方逐轮传入，而不是只靠 setWorkspace 这个全局开关：
+   * 每个任务有自己的工作区，用户切任务时只改渲染层状态，
+   * 如果等 IPC 往返去同步，切太快就会拿错目录干活。传参是原子的。
+   * 三种取值：字符串=具体目录；null=通用工作区；undefined=沿用当前设置。
+   */
+  async chat({
+    input,
+    phase = 'work',
+    history = [],
+    workspace,
+  }: {
+    input: string;
+    phase?: Phase;
+    history?: ChatMessage[];
+    workspace?: string | null;
+  }): Promise<ChatResult> {
+    if (workspace !== undefined) setWorkspaceDir(workspace);
     const messages: ChatMessage[] = [
       ...buildSystemMessages(phase, this.allTools(), getWorkspace()),
       ...history
