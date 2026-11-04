@@ -38,6 +38,7 @@ interface ForgeState {
   home: string;
   model: string;
   models: { list: ProviderView[]; active: string | null };
+  workspace: string | null;
   tools: ToolSummary[];
   pending: ToolSummary[];
   broken: Array<{ id: string; error: string }>;
@@ -72,6 +73,9 @@ interface Bridge {
   setActiveProvider: (id: string | null) => Promise<Envelope<unknown>>;
   listProviderModels: (p: { id: string; baseURL?: string; apiKey?: string }) => Promise<Envelope<string[]>>;
   openHome: () => Promise<Envelope<unknown>>;
+  pickWorkspace: () => Promise<Envelope<ForgeState>>;
+  clearWorkspace: () => Promise<Envelope<ForgeState>>;
+  openWorkspace: () => Promise<Envelope<unknown>>;
   exportPack: (payload: { name: string; ids: string[] }) => Promise<Envelope<{ canceled: boolean; path?: string; count?: number }>>;
   importPack: () => Promise<Envelope<{ canceled: boolean; results?: Array<{ ok: boolean; skipped?: string; error?: string }> }>>;
   onEvent: (cb: (event: EventPayload) => void) => void;
@@ -350,6 +354,7 @@ async function refresh(): Promise<void> {
 
   renderModels(s.models);
   renderRuntime(s);
+  renderWorkspace(s.workspace);
 
   const pendingList = $<HTMLDivElement>('#pendingList');
   pendingList.innerHTML = '';
@@ -397,6 +402,24 @@ function renderRuntime(s: ForgeState): void {
     mcpLine.textContent = 'MCP：已就绪，mcp.json 里还没有配置服务器。';
   } else {
     mcpLine.textContent = 'MCP：' + status.map(([name, text]) => `${name} ${text}`).join('；');
+  }
+}
+
+/**
+ * 顶栏的工作目录。只显示路径最后一段（前面太长），完整路径放 title，
+ * 点它弹系统目录选择器。
+ */
+function renderWorkspace(dir: string | null): void {
+  const btn = $<HTMLButtonElement>('#workspaceBtn');
+  const label = $<HTMLSpanElement>('#wsLabel');
+  btn.classList.toggle('unset', !dir);
+  if (dir) {
+    const parts = dir.split(/[\\/]/).filter(Boolean);
+    label.textContent = parts[parts.length - 1] || dir;
+    btn.title = `${dir}\n点击更换工作目录`;
+  } else {
+    label.textContent = '选择工作目录';
+    btn.title = 'Work 模式下 Agent 可以读写这个目录里的项目文件';
   }
 }
 
@@ -730,29 +753,102 @@ function shorten(s: string, n: number): string {
   return s && s.length > n ? s.slice(0, n) + '…' : s || '';
 }
 
+function fmtElapsed(ms: number): string {
+  return ms < 1000 ? `${Math.max(0, Math.round(ms))}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * 一个统一的心跳给所有等待态刷时长。
+ * 不给每个元素各开一个定时器：轮次结束忘清一个就是内存泄漏。
+ */
+let ticker: number | null = null;
+let turnStarted = 0;
+
+function startTicker(): void {
+  if (ticker !== null) return;
+  turnStarted = Date.now();
+  ticker = window.setInterval(() => {
+    const now = Date.now();
+    const clock = currentTurn?.querySelector<HTMLElement>('.thinking-clock');
+    if (clock) clock.textContent = fmtElapsed(now - turnStarted);
+    for (const chip of document.querySelectorAll<HTMLElement>('.call-chip.running')) {
+      const state = chip.querySelector<HTMLElement>('.t-state');
+      if (state) state.textContent = fmtElapsed(now - Number(chip.dataset.t0 || now));
+    }
+  }, 100);
+}
+
+function stopTicker(): void {
+  if (ticker === null) return;
+  clearInterval(ticker);
+  ticker = null;
+}
+
+/** 等待态：点阵 + 文案 + 秒表。视觉效果移植自 ReactBits 的 Lattice Loader */
+function thinkingBlock(text: string): HTMLElement {
+  const box = el('div', 'thinking');
+  const grid = el('div', 'lattice');
+  grid.setAttribute('aria-hidden', 'true');
+  // 3×5 个格子，按 r+c 定相位，亮带沿对角线扫过去
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 5; c++) {
+      const cell = el('i');
+      cell.style.setProperty('--d', String(r + c));
+      grid.appendChild(cell);
+    }
+  }
+  const label = el('span', 'thinking-label');
+  label.textContent = text;
+  const clock = el('span', 'thinking-clock');
+  clock.textContent = '0ms';
+  box.append(grid, label, clock);
+  return box;
+}
+
+/** 换一句等待文案。重放一次模糊收束，让「第 2 步」这种变化看得出来 */
+function setThinkingLabel(text: string): void {
+  const label = currentTurn?.querySelector<HTMLElement>('.thinking-label');
+  if (!label) return;
+  label.textContent = text;
+  label.classList.remove('blur-in');
+  void label.offsetWidth; // 强制回流，动画才会重播
+  label.classList.add('blur-in');
+}
+
+/** 工具轨迹徽章：填充扫过 + 实时计时，结束转绿或抖动变红。移植自 ReactBits Call Chip */
 function addTrace(event: EventPayload): void {
   if (!currentTurn) return;
   const trace = currentTurn.querySelector('.trace');
   if (!trace) return;
 
-  const item = el('div', 'trace-item');
-  const nm = el('span', 't-name');
-  nm.textContent = event.name || '';
-  const detail = el('span');
-  detail.textContent = event.type === 'tool_call' ? shorten(JSON.stringify(event.args || {}), 90) : '';
-  const state = el('span');
-  state.textContent = event.type === 'tool_call' ? '…' : '';
-  item.append(nm, detail, state);
-
   if (event.type === 'tool_call') {
-    trace.appendChild(item);
-    lastTraceItem = { item, detail, state };
+    const chip = el('div', 'call-chip running');
+    chip.dataset.t0 = String(Date.now());
+    const nm = el('span', 't-name');
+    nm.textContent = event.name || '';
+    const args = el('span', 't-args');
+    args.textContent = shorten(JSON.stringify(event.args || {}), 90);
+    const state = el('span', 't-state');
+    state.textContent = '0ms';
+    chip.append(nm, args, state);
+    trace.appendChild(chip);
+    lastTraceItem = { item: chip, detail: args, state };
   } else if (lastTraceItem) {
-    lastTraceItem.state.textContent = event.ok ? `✓ ${event.ms || 0}ms` : '✗';
-    lastTraceItem.state.className = event.ok ? 't-ok' : 't-fail';
+    const ok = Boolean(event.ok);
+    lastTraceItem.item.classList.remove('running');
+    lastTraceItem.item.classList.add(ok ? 'done' : 'fail');
+    // 成功用真实耗时落定，失败不必报时长，用户只关心没成
+    lastTraceItem.state.textContent = ok ? `✓ ${event.ms || 0}ms` : '✗ 失败';
     lastTraceItem = null;
   }
   scrollBottom();
+}
+
+/** 出错态：给气泡加个红色左边框，别让错误混在正常回答里 */
+function showError(bubble: HTMLElement, message: string): void {
+  bubble.classList.remove('typing', 'streaming');
+  bubble.classList.add('bubble-error');
+  bubble.textContent = message;
 }
 
 async function send(text: string): Promise<void> {
@@ -775,16 +871,19 @@ async function send(text: string): Promise<void> {
 
   // 一条 AI 回复里可能有多轮工具调用，trace 记在气泡上方
   currentTurn = el('div', 'turn turn-bot');
-  currentTurn.innerHTML = '<div class="trace"></div><div class="msg-bot md typing">思考中…</div>';
+  const trace = el('div', 'trace');
+  const bubble = el('div', 'msg-bot md typing');
+  bubble.appendChild(thinkingBlock('思考中…'));
+  currentTurn.append(trace, bubble);
   inner.appendChild(currentTurn);
+  startTicker();
   scrollBottom();
 
   const turn = currentTurn;
-  const bubble = turn.querySelector('.msg-bot') as HTMLElement;
   let streamed = '';
   try {
     const res = await window.tf.chat({ input: text, phase, history: task.history });
-    bubble.classList.remove('typing');
+    bubble.classList.remove('typing', 'streaming');
     if (res.ok) {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
       streamed = res.data.reply || '';
@@ -792,13 +891,13 @@ async function send(text: string): Promise<void> {
       task.history.push({ role: 'user', content: text }, { role: 'assistant', content: streamed });
       task.history = task.history.slice(-8);
     } else {
-      bubble.textContent = '出错了：' + res.error;
+      showError(bubble, '出错了：' + res.error);
     }
   } catch (err) {
-    bubble.classList.remove('typing');
-    bubble.textContent = '出错了：' + (err as Error).message;
+    showError(bubble, '出错了：' + (err as Error).message);
   }
 
+  stopTicker();
   currentTurn = null;
   lastTraceItem = null;
   setBusy(false);
@@ -884,6 +983,22 @@ $<HTMLButtonElement>('#exportBtn').addEventListener('click', async () => {
 
 $<HTMLSpanElement>('#homePath').addEventListener('click', () => window.tf?.openHome());
 
+/* 工作目录：左键选目录，已选中时右键清除 */
+$<HTMLButtonElement>('#workspaceBtn').addEventListener('click', async () => {
+  const res = await window.tf?.pickWorkspace();
+  if (res && !res.ok) alert(res.error);
+  refresh();
+});
+$<HTMLButtonElement>('#workspaceBtn').addEventListener('contextmenu', async (e) => {
+  e.preventDefault();
+  const st = await window.tf?.state();
+  if (!st?.ok || !st.data.workspace) return;
+  if (!confirm(`清除工作目录？\n${st.data.workspace}`)) return;
+  const res = await window.tf?.clearWorkspace();
+  if (res && !res.ok) alert(res.error);
+  refresh();
+});
+
 /* ---------------- 侧栏收放与设置页 ---------------- */
 
 const side = $<HTMLElement>('#side');
@@ -916,20 +1031,24 @@ if (window.tf) {
     if (event.type === 'step' && currentTurn) {
       // 每一步开始时清空累积文本：前一步的内容多半是「我先查一下」，最终答案在最后一步
       streamBuffer = '';
-      const tip = currentTurn.querySelector<HTMLElement>('.msg-bot.typing');
-      if (tip) tip.textContent = `思考中…（第 ${event.step} 步，${event.toolCount} 件工具在场）`;
+      setThinkingLabel(`思考中…（第 ${event.step} 步，${event.toolCount} 件工具在场）`);
     }
     // 流式增量：先拼到本地字符串，再按帧整段重渲染 MD（每片都解析会 O(n²)）
     if (event.type === 'delta' && currentTurn && event.delta) {
       streamBuffer += event.delta;
       const turn = currentTurn;
-      turn.querySelector('.msg-bot.typing')?.classList.remove('typing');
+      const bubble = turn.querySelector<HTMLElement>('.msg-bot');
+      if (!bubble) return;
+      // 首个增量到达就把等待块换成真内容，并挂上打字光标
+      if (bubble.classList.contains('typing')) {
+        bubble.classList.remove('typing');
+        bubble.classList.add('streaming');
+        bubble.innerHTML = '';
+      }
       if (!renderQueued) {
         renderQueued = true;
         requestAnimationFrame(() => {
           renderQueued = false;
-          const bubble = turn.querySelector<HTMLElement>('.msg-bot');
-          if (!bubble) return;
           bubble.innerHTML = markdownToHtml(streamBuffer);
           scrollBottom();
         });

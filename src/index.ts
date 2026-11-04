@@ -1,5 +1,6 @@
 import fs from 'node:fs';
-import { dirs, ensureDirs } from './core/paths.js';
+import path from 'node:path';
+import { dirs, ensureDirs, getWorkspace, readJsonFile, setWorkspaceDir } from './core/paths.js';
 import { store } from './core/store.js';
 import { executeTool } from './core/bus.js';
 import { selectTools } from './core/retrieve.js';
@@ -23,12 +24,16 @@ export interface Settings {
   /** 多模型配置：只存用户填过的字段，预设的定义在 core/models.ts */
   providers?: Array<Partial<ModelProvider>>;
   activeProvider?: string | null;
+  /** Work 模式下选中的项目目录，重启后恢复 */
+  workspace?: string | null;
 }
 
 export interface ForgeState {
   home: string;
   model: string;
   models: { list: ProviderView[]; active: string | null };
+  /** 当前工作目录；null 表示还没选 */
+  workspace: string | null;
   sessionId: string;
   tools: ToolSummary[];
   pending: ToolSummary[];
@@ -48,9 +53,18 @@ export interface ChatResult {
 
 function loadSettings(): Settings {
   try {
-    return JSON.parse(fs.readFileSync(dirs.settings, 'utf8')) as Settings;
+    return readJsonFile(dirs.settings) as Settings;
   } catch {
     ensureDirs();
+    // 文件存在但解析不了，先把原文挪到旁边再重建。
+    // 直接覆盖会把用户的 API Key 和模型配置一次性抹掉，而这个错误往往只是多了个 BOM。
+    if (fs.existsSync(dirs.settings)) {
+      try {
+        fs.renameSync(dirs.settings, `${dirs.settings}.broken-${Date.now()}`);
+      } catch {
+        /* 备份失败也不能拦着开机 */
+      }
+    }
     fs.writeFileSync(
       dirs.settings,
       JSON.stringify(
@@ -135,6 +149,17 @@ export class ToolForge {
 
   async init({ connectMcp = true }: { connectMcp?: boolean } = {}): Promise<this> {
     this.seeded = installSeeds();
+    // 恢复上次选的工作目录。目录可能已被删掉或挪走，那就当没选，
+    // 而不是留一个指向虚空的路径让工具跑到一半才崩。
+    const saved = this.settings.workspace;
+    if (saved) {
+      try {
+        if (fs.statSync(saved).isDirectory()) setWorkspaceDir(saved);
+        else this.settings.workspace = null;
+      } catch {
+        this.settings.workspace = null;
+      }
+    }
     if (connectMcp) await mcp.init();
     return this;
   }
@@ -265,6 +290,30 @@ export class ToolForge {
     }
   }
 
+  /**
+   * 选择工作目录（Work 模式的项目文件夹）。
+   * 只认真实存在的目录：选错了要立刻报错，别等工具跑到一半才失败。
+   */
+  setWorkspace(dir: string | null): ForgeState {
+    if (dir === null || dir === '') {
+      setWorkspaceDir(null);
+    } else {
+      const abs = path.resolve(dir);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(abs);
+      } catch {
+        throw new Error(`目录不存在：${abs}`);
+      }
+      if (!stat.isDirectory()) throw new Error(`不是目录：${abs}`);
+      setWorkspaceDir(abs);
+    }
+    this.settings.workspace = dir ? path.resolve(dir) : null;
+    this.persist();
+    audit.append({ type: 'workspace_select', workspace: dir ? path.resolve(dir) : null });
+    return this.state();
+  }
+
   /** 当前可注入的全量工具：元工具 + 已放行/本会话 + MCP */
   allTools(): Tool[] {
     const metas = metaToolDefs.map((d) => metaAsTool(d.name, d.description, d.input));
@@ -301,7 +350,7 @@ export class ToolForge {
 
   async chat({ input, phase = 'work', history = [] }: { input: string; phase?: Phase; history?: ChatMessage[] }): Promise<ChatResult> {
     const messages: ChatMessage[] = [
-      ...buildSystemMessages(phase, this.allTools()),
+      ...buildSystemMessages(phase, this.allTools(), getWorkspace()),
       ...history
         .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
         .slice(-8),
@@ -375,6 +424,7 @@ export class ToolForge {
         active: this.activeProvider()?.id ?? null,
       },
       sessionId: this.sessionId,
+      workspace: getWorkspace(),
       tools: tools.map(summarize),
       pending: tools.filter((t) => t.status === 'pending').map(summarize),
       broken,

@@ -2,8 +2,8 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { toolDir } from '../core/paths.js';
-import { pickEnv } from '../core/permissions.js';
+import { toolDir, getWorkspace, WORKSPACE_ROOT } from '../core/paths.js';
+import { pickEnv, resolveRuleRoot } from '../core/permissions.js';
 import type { Json, Tool } from '../types.js';
 
 // 代码兜底的执行路径：另起子进程，Node 权限模型 + 引导层双管齐下。
@@ -37,12 +37,25 @@ function childEnv(tool: Tool): NodeJS.ProcessEnv {
   return env;
 }
 
-function buildArgs(flag: string | null, tool: Tool): string[] {
+export function buildScriptArgs(flag: string | null, tool: Tool): string[] {
   const dir = toolDir(tool.id);
   const dataDir = path.join(dir, '.data');
   const args: string[] = [];
   if (flag) {
     args.push(flag, `--allow-fs-read=${dir}`, `--allow-fs-read=${RUNTIME}`, `--allow-fs-write=${dataDir}`);
+    // 只有 @workspace 需要额外的 OS 级白名单：工具目录本来就已经放行了。
+    // 别把每条 fsRead / fsWrite 规则都塞进来——像 "**" 或尚未创建的目录会解析成
+    // 不存在的路径，Node 会起不来（或直接 ABORT），把原本正常的工具一起弄崩。
+    for (const rule of tool.permissions?.fsRead || []) {
+      if (rule !== WORKSPACE_ROOT) continue;
+      const root = resolveRuleRoot(tool.id, rule);
+      if (root) args.push(`--allow-fs-read=${root}`);
+    }
+    for (const rule of tool.permissions?.fsWrite || []) {
+      if (rule !== WORKSPACE_ROOT) continue;
+      const root = resolveRuleRoot(tool.id, rule);
+      if (root) args.push(`--allow-fs-write=${root}`);
+    }
   }
   args.push('--max-old-space-size=256', RUNTIME);
   return args;
@@ -50,7 +63,7 @@ function buildArgs(flag: string | null, tool: Tool): string[] {
 
 function spawnOnce(flag: string | null, tool: Tool, payload: unknown, timeoutMs: number): Promise<SpawnOutcome> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, buildArgs(flag, tool), {
+    const child = spawn(process.execPath, buildScriptArgs(flag, tool), {
       env: childEnv(tool),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -122,6 +135,7 @@ export async function runScript(tool: Tool, input: Json): Promise<unknown> {
     entry,
     toolDir: dir,
     dataDir,
+    workspace: getWorkspace(),
     perm: tool.permissions,
     allowedEnv: tool.permissions?.env || [],
   };

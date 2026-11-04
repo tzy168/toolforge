@@ -45,6 +45,7 @@ interface Payload {
   perm?: { net?: string[]; fsRead?: string[]; fsWrite?: string[] };
   toolDir?: string;
   dataDir?: string;
+  workspace?: string | null;
   allowedEnv?: string[];
   entry?: string;
 }
@@ -86,6 +87,7 @@ async function run(): Promise<unknown> {
   const perm = req.perm ?? {};
   const toolDir = req.toolDir ?? '';
   const dataDir = req.dataDir ?? '';
+  const workspace = req.workspace ?? null;
   const allowedEnv = req.allowedEnv ?? [];
 
   // 工具自己的 console.log 不能污染 stdout 的结果通道
@@ -142,24 +144,44 @@ async function run(): Promise<unknown> {
     });
   }
 
-  // 读：相对工具包目录（可读自己带的数据文件）
-  // 写：相对数据目录（.data，可写范围由 --allow-fs-write 兜底）
+  // 读：相对工具包目录（可读自己带的数据文件）；写：相对数据目录（.data）
+  // 例外是 @workspace：指向用户选中的项目文件夹，路径由宿主传进来。
+  // 沙箱不自己猜工作目录，宿主没传就等于没这个根——宁可拒绝，不可越权。
   function guardFs(target: string, roots: string[] | undefined, action: '读' | '写'): string {
-    const base = action === '写' ? dataDir : toolDir;
-    const abs = path.resolve(base, String(target));
-    const allowed = (roots || []).some((root) => {
-      const r = path.resolve(base, root);
-      return abs === r || abs.startsWith(r + path.sep);
-    });
-    if (!allowed) {
-      throw new Error(`权限拒绝：未获准${action} ${abs}（已声明：${(roots || []).join(', ') || '无'}）`);
+    const raw = String(target);
+    const list = roots || [];
+    const defaultBase = action === '写' ? dataDir : toolDir;
+    const hasWs = list.includes('@workspace') && Boolean(workspace);
+
+    const candidates = path.isAbsolute(raw)
+      ? [path.resolve(raw)]
+      : [
+          // 先按默认根解释；同时声明了 @workspace 时再试一次工作目录。
+          // 这样既照顾「工具自带的相对路径」，也照顾「项目里的相对路径」，
+          // 而不是逼工具作者为两种根分别拼绝对路径。
+          path.resolve(defaultBase, raw),
+          ...(hasWs ? [path.resolve(workspace as string, raw)] : []),
+        ];
+
+    for (const abs of candidates) {
+      const allowed = list.some((root) => {
+        const r =
+          root === '@workspace' ? (workspace ? path.resolve(workspace) : null) : path.resolve(defaultBase, root);
+        if (!r) return false;
+        return abs === r || abs.startsWith(r + path.sep);
+      });
+      if (allowed) return abs;
     }
-    return abs;
+    throw new Error(
+      `权限拒绝：未获准${action} ${candidates[0]}（已声明：${list.join(', ') || '无'}）`
+    );
   }
 
   const ctx = {
     input,
     workdir: dataDir,
+    // 用户选中的项目目录。未选择时为 null，工具应据此提示用户先选目录。
+    workspace,
     log: toErr,
     sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, Math.min(Number(ms) || 0, 30000))),
     env: (key: string): string | undefined => (allowedEnv.includes(key) ? process.env[key] : undefined),

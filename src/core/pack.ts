@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { store } from './store.js';
 import { normalizeTool, type RawTool } from './spec.js';
-import { dirs, ensureDirs } from './paths.js';
+import { dirs, ensureDirs, readJsonFile } from './paths.js';
 import { staticScan } from './review.js';
 import type { Finding } from '../types.js';
 
@@ -111,5 +111,5 @@ export function importPack(pack: unknown, { approve = false }: { approve?: boole
 }
 
 export function readPackFile(file: string): Pack {
-  return JSON.parse(fs.readFileSync(file, 'utf8')) as Pack;
+  return readJsonFile(file) as Pack;
 }

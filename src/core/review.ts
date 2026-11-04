@@ -1,5 +1,6 @@
 import vm from 'node:vm';
 import * as audit from '../core/audit.js';
+import { WORKSPACE_ROOT } from '../core/paths.js';
 import type { Finding, Grade, TestResult, Tool } from '../types.js';
 
 // 静态扫描：只看代码里那些「不该出现」的痕迹。不是完备防御，是筛子。
@@ -62,12 +63,15 @@ export function grade(tool: Tool, findings: Finding[] = []): Grade {
   if (p.fsWrite?.length || p.env?.length) {
     if (p.fsWrite?.length) reasons.push(`可写文件：${p.fsWrite.join(', ')}`);
     if (p.env?.length) reasons.push(`可读密钥：${p.env.join(', ')}`);
+    // 写工作目录等于能改用户的项目源码，比写工具自己的 .data 危险得多，必须说清楚
+    if (p.fsWrite?.includes(WORKSPACE_ROOT)) reasons.push('可写工作目录（会改动用户项目里的文件）');
     return { level: 'L2', needsHuman: true, approved: false, reasons };
   }
 
   if (p.net?.length || p.fsRead?.length || tool.kind === 'script') {
     if (p.net?.length) reasons.push(`可访问网络：${p.net.join(', ')}`);
     if (p.fsRead?.length) reasons.push(`可读文件：${p.fsRead.join(', ')}`);
+    if (p.fsRead?.includes(WORKSPACE_ROOT)) reasons.push('可读工作目录（会看到用户项目的源码）');
     if (tool.kind === 'script') reasons.push('需在沙箱内执行代码');
     return { level: 'L1', needsHuman: false, approved: true, reasons };
   }

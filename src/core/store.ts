@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { dirs, ensureDirs, safeId, toolDir } from './paths.js';
+import { dirs, ensureDirs, readJsonFile, safeId, toolDir } from './paths.js';
 import { normalizeTool, type RawTool } from './spec.js';
 import type { Tool } from '../types.js';
 
@@ -70,7 +70,7 @@ export class ToolStore {
   read(dir: string): Tool | null {
     const file = path.join(dir, 'tool.json');
     if (!fs.existsSync(file)) return null;
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as RawTool;
+    const raw = readJsonFile(file) as RawTool;
     const tool = normalizeTool(raw);
     // 脚本代码不塞进 tool.json，按需从文件读回
     if (tool.kind === 'script' && tool.impl.entry) {
@@ -98,7 +98,7 @@ export class ToolStore {
     fs.mkdirSync(dir, { recursive: true });
 
     if (fs.existsSync(file)) {
-      const prev = JSON.parse(fs.readFileSync(file, 'utf8')) as RawTool;
+      const prev = readJsonFile(file) as RawTool;
       // 同名同版本重建（Agent 改完实现再调一次 create_tool）也得升版本，
       // 否则覆盖后没有快照可回滚，导出包也会被「同版本已存在」误判成重复。
       // 状态切换（patch）不算版本更迭，由调用方传 bump:false 跳过。

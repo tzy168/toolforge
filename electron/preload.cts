@@ -13,6 +13,9 @@ contextBridge.exposeInMainWorld('tf', {
   setActiveProvider: (id: string | null) => ipcRenderer.invoke('tf:setActiveProvider', id),
   listProviderModels: (p: unknown) => ipcRenderer.invoke('tf:listProviderModels', p),
   openHome: () => ipcRenderer.invoke('tf:openHome'),
+  pickWorkspace: () => ipcRenderer.invoke('tf:pickWorkspace'),
+  clearWorkspace: () => ipcRenderer.invoke('tf:clearWorkspace'),
+  openWorkspace: () => ipcRenderer.invoke('tf:openWorkspace'),
   exportPack: (payload: unknown) => ipcRenderer.invoke('tf:exportPack', payload),
   importPack: () => ipcRenderer.invoke('tf:importPack'),
   onEvent: (cb: (event: unknown) => void) => {

@@ -23,8 +23,13 @@
 
       <section class="view" id="viewChat">
         <header class="top">
-          <!-- 左侧占位与右侧状态等宽，中间的页签才能真正居中 -->
-          <div class="top-side"></div>
+          <!-- 左侧是工作目录选择器；中间页签；右侧模型与工具数 -->
+          <div class="top-side">
+            <button id="workspaceBtn" class="ws-btn" title="选择工作目录">
+              <span class="ws-icon" aria-hidden="true">▸</span>
+              <span id="wsLabel" class="ws-label">选择工作目录</span>
+            </button>
+          </div>
           <div class="tabs">
             <button class="tab active" data-phase="work">Work</button>
             <button class="tab" data-phase="create">Create Tools</button>

@@ -15,9 +15,23 @@ function inventory(tools: Tool[], limit = 40): string {
   return names + extra;
 }
 
-export function workPrompt(tools: Tool[]): string {
+/** 当前工作目录那段话。没选就明说没选，别让模型猜路径 */
+function workspaceNote(workspace?: string | null): string {
+  if (!workspace) {
+    return `## 工作目录
+当前没有选择工作目录。涉及项目文件的活儿，先让用户在上方选一个文件夹；你也可以直接问路径，但不要凭空猜。`;
+  }
+  return `## 工作目录
+${workspace}
+
+这就是用户当前的项​目目录。读写文件一律用绝对路径，并且只能落在该目录内（工具的 permissions 里要声明 \`@workspace\` 才有这个权限）。不要访问目录之外的东西。`;
+}
+
+export function workPrompt(tools: Tool[], workspace?: string | null): string {
   return `你是 ToolForge 的执行型 Agent。这里信奉「一切皆 Tool」——凡能力，皆为工具。
 口号：创建你自己的 Agent。
+
+${workspaceNote(workspace)}
 
 ## 现有工具（仅名称与信任等级）
 ${inventory(tools)}
@@ -47,6 +61,15 @@ export const createPrompt = `你是 ToolForge 的工具锻造师。你的产出�
 
 声明式能覆盖的，绝不写代码。代码风险高一个数量级。
 
+## 要碰用户项目文件时
+permissions 里用 \`@workspace\` 表示「用户选中的项目目录」，而不是写死某个绝对路径：
+- 只读：\`fsRead: ["@workspace"]\` → L1，自动放行
+- 要写：\`fsWrite: ["@workspace"]\` → L2，转人工审核（会改用户源码，必须让人点头）
+
+代码里用 \`ctx.workspace\` 拿这个目录的绝对路径；它为 null 说明用户还没选，直接报错让用户选，不要猜。
+只声明了 \`@workspace\` 时，\`ctx.fs\` 的相对路径以工作目录为基准（\`ctx.fs.read('src/a.ts')\` 就是项目里的那个文件）；
+同时声明了工具目录内的路径则以工具目录为基准，此时对项目文件请传绝对路径。
+
 ## 写代码的规矩（kind = script）
 - 入口导出 (input, ctx) => result，CommonJS 语法
 - 网络一律走 ctx.net.get / ctx.net.json / ctx.net.request，禁止 require('http'|'https'|'net')
@@ -68,7 +91,7 @@ export interface ChatMessage {
   content: string;
 }
 
-export function buildSystemMessages(phase: Phase, tools: Tool[]): ChatMessage[] {
-  const base = phase === 'create' ? createPrompt : workPrompt(tools);
+export function buildSystemMessages(phase: Phase, tools: Tool[], workspace?: string | null): ChatMessage[] {
+  const base = phase === 'create' ? createPrompt : workPrompt(tools, workspace);
   return [{ role: 'system', content: base }];
 }

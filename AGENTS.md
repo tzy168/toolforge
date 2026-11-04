@@ -33,13 +33,14 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 | `src/core/permissions.ts` | 域名/路径/环境变量白名单判定 |
 | `src/core/retrieve.ts` | 两级召回，只把相关工具 schema 注入模型 |
 | `src/core/models.ts` | 多模型服务商：DeepSeek/Kimi 预设、自定义合并、选中判定 |
-| `src/core/{template,audit,pack,paths,seed}.ts` | 占位符取值、审计日志、工具包导入导出、目录常量、种子工具 |
+| `src/core/{template,audit,pack,seed}.ts` | 占位符取值、审计日志、工具包导入导出、种子工具 |
+| `src/core/paths.ts` | 目录常量、`@workspace` 工作目录状态、BOM 安全的 JSON 读取 |
 | `src/executors/declarative.ts` | http / transform / shell / compose 四种声明式实现 |
 | `src/executors/script.ts` | 起子进程跑脚本类工具，试探 `--permission` 开关 |
 | `src/executors/runtime-child.cts` | 沙箱引导层：锁 `Module._load`，注入受控 `ctx.net` / `ctx.fs` |
 | `src/agent/{loop,prompts,meta-tools}.ts` | LLM 循环、两套人格提示词、元工具（list/search/create） |
 | `src/mcp/client.ts` | 可选 MCP 适配器，SDK 没装也要能开机 |
-| `src/ui/` | 纯 HTML/CSS/JS 渲染层，`app.ts` 只经 `window.tf` 通信；`vendor.d.ts` 声明 marked/dompurify |
+| `src/ui/` | 纯 HTML/CSS/JS 渲染层，`app.ts` 只经 `window.tf` 通信；`vendor.d.ts` 声明 marked/dompurify。等待/工具徽章等动效是纯 CSS，视觉参考 ReactBits 但没有引入 React |
 | `scripts/copy-ui-vendor.mjs` | 构建时把 marked / dompurify 的 ESM 产物拷到 `src/ui/build/vendor/`（CSP 禁 CDN，界面无打包器） |
 | `electron/` | `main.cts` 主进程 + IPC handler，`preload.cts` 桥接白名单 |
 | `bin/cli.ts` | REPL 与 `--selftest` |
@@ -79,6 +80,9 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 三层防线，都不完备，别宣传成「沙箱」：
 
 - **能力声明**：`permissions` 默认全空；域名白名单不支持 `*`；路径必须落在工具目录内。
+- **工作目录是独立的一层**：用户可在顶栏选一个项目目录，工具通过 `fsRead/fsWrite: ['@workspace']` 申请访问。它**不是**沙箱目录的放宽——只读 L1 自动放行、写入 L2 转人工，未选目录时工具会收到明确报错。宿主侧判定在 `permissions.pathAllowed`，子进程内在 `runtime-child.cts` 的 `guardFs`，两处都必须认 `@workspace`。
+- **`--allow-fs-*` 只给 `@workspace` 加**：工具目录与 `runtime-child.cjs` 是固定放行项。别把每条权限规则都塞进启动参数——`**` 或未创建的目录会解析成不存在的路径，Node 会直接 abort，把原本正常的工具一起弄崩（踩过）。
+- **相对路径的解析顺序**：先按默认根（读=工具目录 / 写=`.data`），若同时声明了 `@workspace` 再试工作目录，首个通过权限校验的胜出。这样工具既能读自己的数据，也能用 `'src/a.ts'` 这种自然写法指向项目文件。
 - **进程隔离**：脚本工具起子进程，优先用 Node 的 `--permission`（Node 22+）/ `--experimental-permission`（Node 20），逐个试探，都不行就**降级为无 OS 级隔离**（`permDisabled`），这是已知取舍。探测结果经 `permissionSupport()` 进 `ForgeState.sandbox`，设置页会如实显示；`probed: false` 表示本次启动还没跑过脚本工具，不能声称隔离已生效。
 - **模块拦截**：`runtime-child.cts` 里改写 `Module._load`，掐断 http/https/net/child_process，工具只能用注入的 `ctx.net` / `ctx.fs`。
 - **路径守卫只有一份**：真正拦路径的是 `runtime-child.cts` 的 `guardFs`，宿主侧不再另留一份等价实现。
@@ -105,6 +109,7 @@ untested ──用例通过、低危──> active
 
 ## 常见坑
 
+- **配置文件一律用 `readJsonFile()` 读**（`core/paths.ts`）。它剥掉 UTF-8 BOM——Windows 记事本 / PowerShell 存文件默认带 BOM，`JSON.parse` 见到就抛错，上层会当成"文件损坏"。`loadSettings` 在这种情况会先把原文备份成 `settings.json.broken-<时间戳>` 再重建，**绝不静默覆盖用户配置**。
 - **Windows 下 npx/npm/pnpm 是 `.cmd`**，MCP 连接必须经 `cmd /c` 转一手（`src/mcp/client.ts` 已处理）。
 - **Electron 内置的 Node 未必支持权限开关**，`runScript` 的 `badFlag` 判定靠 stderr 关键字，别把工具自身的报错误判成降级。
 - **渲染层没有 Node**：`contextIsolation: true`、`sandbox: true`，CSP 禁内联脚本。新 IPC 必须同时在 `preload.cts` 白名单里出现。
@@ -112,4 +117,6 @@ untested ──用例通过、低危──> active
 - **模型上下文会被撑爆**：结果超 12000 字在 `clampForModel` 截断，工具注入走 `selectTools` 召回，别改成全量注入。
 - **流式渲染要按帧合并**：`delta` 事件可能几十毫秒来一片，每片都 `markdownToHtml` 重解析是 O(n²)，`app.ts` 用 `requestAnimationFrame` 节流。别把这一层去掉。
 - **别在流式输出时强制 `scrollTop` 到底**：用户往上翻着读时硬拽回底部等于不让人看，`scrollBottom()` 只在贴底时才滚。
-- **截图验证**：`TF_SMOKE=1` 会加载完即退出并打印桥接状态；再加 `TF_SHOT=<png 路径>` 落一张截图，`TF_SMOKE_JS="<js>"` 可在截图前跑一段界面操作（例如点开设置页），用来验证非默认页面。
+- **等待态的心跳只有一个**：`startTicker()` / `stopTicker()` 全局共用一个 100ms 定时器，同时刷新等待秒表和所有 `.call-chip.running` 的耗时。别给每个元素各开一个 `setInterval`——轮次结束忘清一个就是泄漏。
+- **界面动效全部用纯 CSS 写**：视觉参考 ReactBits，但不引 React、不引 GSAP（界面无打包器 + CSP 禁 CDN）。新增动效必须同时进 `prefers-reduced-motion` 的白名单，且优先动画 `transform` / `opacity` / `background`，别动会触发重排的属性。
+- **截图验证**：`TF_SMOKE=1` 会加载完即退出并打印桥接状态；再加 `TF_SHOT=<png 路径>` 落一张截图，`TF_SMOKE_JS="<js>"` 可在截图前跑一段界面操作（例如点开设置页），用来验证非默认页面。脚本里若要写中文，**写成 ASCII 或直接内联到命令行**：PowerShell 5.1 的 `Get-Content` 会按 ANSI 解码 UTF-8 文件，中文会把脚本读成乱码。

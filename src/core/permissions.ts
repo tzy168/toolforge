@@ -1,3 +1,5 @@
+import path from 'node:path';
+import { getWorkspace, isInside, toolDir, WORKSPACE_ROOT } from './paths.js';
 import type { Tool } from '../types.js';
 
 /** 域名白名单匹配，支持 *.example.com */
@@ -47,4 +49,37 @@ export function pickEnv(tool: Tool): Record<string, string> {
     if (v !== undefined) out[key] = v;
   }
   return out;
+}
+
+/**
+ * 把一条权限规则解析成绝对根目录。
+ * 工具目录内的相对路径仍相对工具目录；`@workspace` 指向用户选定的项目文件夹。
+ */
+export function resolveRuleRoot(toolId: string, rule: string): string | null {
+  if (rule === WORKSPACE_ROOT) return getWorkspace();
+  return path.resolve(toolDir(toolId), rule);
+}
+
+/**
+ * 校验 `@workspace` 能不能用：没选工作目录就直接报错，别让工具以为是「没权限」。
+ * 返回的提示会原样喂回模型，所以要说清楚怎么解决。
+ */
+export function assertWorkspaceSelected(rules: string[] | undefined, toolName: string): void {
+  if (!(rules || []).includes(WORKSPACE_ROOT)) return;
+  if (!getWorkspace()) {
+    throw new Error(`工具 ${toolName} 需要工作目录，但当前没有选择。请让用户在左上角选一个项目文件夹，或在设置里挑目录。`);
+  }
+}
+
+/** 路径是否落在声明的范围内——沙箱与宿主共用的唯一判定 */
+export function pathAllowed(
+  target: string,
+  rules: string[] = [],
+  toolId: string
+): boolean {
+  const abs = path.resolve(target);
+  return rules.some((rule) => {
+    const root = resolveRuleRoot(toolId, rule);
+    return root !== null && isInside(abs, root);
+  });
 }

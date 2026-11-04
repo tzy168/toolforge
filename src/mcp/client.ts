@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { dirs, ensureDirs } from '../core/paths.js';
+import { dirs, ensureDirs, readJsonFile } from '../core/paths.js';
 import type { Json, Tool } from '../types.js';
 
 // MCP 适配器：把现成的 MCP 服务器当成工具源吃进来，解决冷启动。
@@ -51,7 +51,7 @@ export function readConfig(): McpConfig {
     return { servers: {} };
   }
   try {
-    const cfg = JSON.parse(fs.readFileSync(dirs.mcpFile, 'utf8')) as Partial<McpConfig>;
+    const cfg = readJsonFile(dirs.mcpFile) as Partial<McpConfig>;
     return { servers: {}, ...cfg };
   } catch {
     return { servers: {}, error: 'mcp.json 解析失败' };
