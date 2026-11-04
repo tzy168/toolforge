@@ -1,9 +1,12 @@
-import { store } from '../core/store.js';
+import { store, isUsable } from '../core/store.js';
 import { normalizeTool, describePermissions, type RawTool } from '../core/spec.js';
 import { selectTools, indexOf } from '../core/retrieve.js';
 import { staticScan, grade, runExamples } from '../core/review.js';
 import { executeTool } from '../core/bus.js';
 import * as audit from '../core/audit.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { dirs, toolDir } from '../core/paths.js';
 import type { Json, JsonSchema, Tool, ToolImpl, ToolResult, Permissions } from '../types.js';
 
 // 元工具：Agent 用来「看仓库、找工具、造工具」的那几件。
@@ -20,6 +23,8 @@ export interface MetaDef {
   description: string;
   input: JsonSchema;
   handler: (args: Json, ctx: MetaContext) => Promise<string>;
+  /** 元工具默认 L0；有破坏性副作用（改仓库）的要显式拔高，别让模型误判风险 */
+  trust?: Tool['trust'];
 }
 
 const createToolSchema: JsonSchema = {
@@ -85,19 +90,47 @@ const createToolSchema: JsonSchema = {
 export const metaToolDefs: MetaDef[] = [
   {
     name: 'list_tools',
-    description: '列出当前可用的全部工具（名称、类型、信任等级、状态、一句话说明）。不确定有什么能力时先调它。',
-    input: { type: 'object', properties: {}, additionalProperties: false },
-    async handler(_args, ctx) {
-      const all = ctx.allTools();
+    description:
+      '列出工具仓库里的全部工具，并标明哪些当前可用、哪些不可用（已停用/待审核/用例未过）。默认全量；只想看能调用的传 availableOnly=true。',
+    input: {
+      type: 'object',
+      properties: {
+        availableOnly: { type: 'boolean', description: '只列当前可调用（已放行或本会话可用）的工具，默认 false' },
+      },
+      additionalProperties: false,
+    },
+    async handler(args, ctx) {
+      const availableOnly = args.availableOnly === true;
+      // ctx.allTools() 只有「此刻能调用」的那批：元工具 + 已放行/本会话 + MCP。
+      // 仓库里被停用、待审核、用例没过的它一概看不见——而「我那件工具怎么不见了」
+      // 恰恰是查工具时最常问的问题。所以全量清单直接从 store 取，再逐件标上可否调用。
+      const callable = ctx.allTools();
+      const callableNames = new Set(callable.map((t) => t.name));
+      const { tools: repo, broken } = store.list({ includeBroken: true });
+
+      const row = (t: Tool, isCallable: boolean) => ({
+        name: t.name,
+        kind: t.kind,
+        trust: t.trust,
+        status: t.status,
+        callable: isCallable,
+        description: t.description.slice(0, 80),
+      });
+
+      // 元工具是内核动态注入的，不在仓库目录里，得单独补一份，
+      // 否则这份「全部工具」清单会漏掉自省能力本身。
+      const metas = callable.filter((t) => t.kind === 'meta').map((t) => row(t, true));
+      const storeRows = repo.map((t) => row(t, callableNames.has(t.name)));
+      const rows = availableOnly ? storeRows.filter((r) => r.callable) : [...metas, ...storeRows];
+
+      const byStatus: Record<string, number> = {};
+      for (const r of storeRows) byStatus[r.status] = (byStatus[r.status] || 0) + 1;
+
       return JSON.stringify({
-        total: all.length,
-        tools: all.map((t) => ({
-          name: t.name,
-          kind: t.kind,
-          trust: t.trust,
-          status: t.status,
-          description: t.description.slice(0, 80),
-        })),
+        total: rows.length,
+        callable: storeRows.filter((r) => r.callable).length + metas.length,
+        repo: { total: storeRows.length, byStatus, broken: broken.map((b) => b.id) },
+        tools: rows,
       });
     },
   },
@@ -128,7 +161,125 @@ export const metaToolDefs: MetaDef[] = [
       return createTool(args, ctx);
     },
   },
+  {
+    name: 'manage_tool',
+    description:
+      '管理工具仓库：查询某件工具的详情、打开/关闭（enable/disable）、删除（remove，删前自动备份到 staging/trash 可恢复）。内核元工具不允许开关或删除。',
+    input: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'inspect', 'enable', 'disable', 'remove'],
+          description: 'list=列全量概览；inspect=看详情；enable/disable=开关；remove=删除（需 confirm）',
+        },
+        tool: { type: 'string', description: '工具名或 id，action 不是 list 时必填' },
+        confirm: { type: 'boolean', description: 'remove 必须显式传 true，防误删' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    trust: 'L2',
+    async handler(args, ctx) {
+      const action = String(args.action ?? '');
+      const key = String(args.tool ?? '').trim();
+
+      if (action === 'list') {
+        const { tools: repo, broken } = store.list({ includeBroken: true });
+        return JSON.stringify({
+          total: repo.length,
+          broken: broken.map((b) => b.id),
+          tools: repo.map((t) => ({
+            name: t.name,
+            id: t.id,
+            kind: t.kind,
+            trust: t.trust,
+            status: t.status,
+            callable: isUsable(t, ctx.sessionId),
+          })),
+        });
+      }
+
+      if (!key) throw new Error(`action=${action} 需要 tool（工具名或 id）`);
+
+      const target = store.findByCallName(key) || store.get(key);
+      if (!target) throw new Error(`工具不存在：${key}。可先用 manage_tool action=list 看全量清单`);
+
+      // 元工具不在仓库目录里、本来就改不到；这道闸同时防住「以后有人把元工具搬进仓库」，
+      // 避免 manage_tool 把 list_tools 自己关掉、Agent 从此失去自省能力。
+      if (target.kind === 'meta' || findMetaTool(target.name)) {
+        throw new Error(`拒绝：${target.name} 是内核元工具，不支持开关或删除`);
+      }
+
+      if (action === 'inspect') {
+        return JSON.stringify({
+          name: target.name,
+          id: target.id,
+          kind: target.kind,
+          version: target.version,
+          trust: target.trust,
+          status: target.status,
+          callable: isUsable(target, ctx.sessionId),
+          description: target.description,
+          permissions: describePermissions(target.permissions),
+          examples: (target.examples || []).length,
+          lastRun: target.meta?.lastRun ?? null,
+          review: target.meta?.review
+            ? { level: target.meta.review.level, testsOk: (target.meta.review.tests || []).every((r) => r.ok) }
+            : null,
+        });
+      }
+
+      if (action === 'enable') {
+        // 用例没过的不能靠开关绕审核直接启用——与 UI 的 setEnabled 同一条规则
+        if (target.status === 'untested') {
+          throw new Error('这件工具的自带用例还没通过，不能直接启用；让它重造一次，用例过了再开');
+        }
+        store.patch(target.id, { status: 'active', sessionId: null });
+        audit.append({ type: 'meta_manage', action: 'enable', tool: target.name });
+        return JSON.stringify({ ok: true, name: target.name, status: 'active', callable: true });
+      }
+
+      if (action === 'disable') {
+        store.patch(target.id, { status: 'disabled', sessionId: null });
+        audit.append({ type: 'meta_manage', action: 'disable', tool: target.name });
+        return JSON.stringify({ ok: true, name: target.name, status: 'disabled', callable: false });
+      }
+
+      if (action === 'remove') {
+        if (args.confirm !== true) {
+          throw new Error('remove 是破坏性操作（会删掉工具目录），必须显式传 confirm: true');
+        }
+        const backup = backupToolDir(target.id);
+        store.remove(target.id);
+        audit.append({ type: 'meta_manage', action: 'remove', tool: target.name, backup });
+        return JSON.stringify({
+          ok: true,
+          removed: target.name,
+          backup,
+          hint: '已备份到上述目录；要恢复就把该目录拷回工具仓库再重启。',
+        });
+      }
+
+      throw new Error(`未知 action：${action}（可用 list / inspect / enable / disable / remove）`);
+    },
+  },
 ];
+
+/**
+ * 删工具前先把整个目录备一份到 staging/trash。
+ * store.remove 是 rmSync 递归强删、不可撤销；留个备份才有「删错了」的退路。
+ */
+function backupToolDir(id: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dest = path.join(dirs.staging, 'trash', `${id}-${stamp}`);
+  const src = toolDir(id);
+  if (fs.existsSync(src)) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.cpSync(src, dest, { recursive: true });
+  }
+  return dest;
+}
 
 function buildImpl(args: Json): ToolImpl {
   const kind = String(args.kind ?? '');

@@ -39,6 +39,8 @@ interface ForgeState {
   model: string;
   models: { list: ProviderView[]; active: string | null };
   workspace: string | null;
+  /** 此刻真正能用的工具数（元工具 + 已放行 + 本会话临时可用 + MCP），界面别自己数 */
+  toolCount: number;
   tools: ToolSummary[];
   pending: ToolSummary[];
   broken: Array<{ id: string; error: string }>;
@@ -57,6 +59,8 @@ interface EventPayload {
   preview?: string;
   content?: string;
   delta?: string;
+  /** 推理增量（type=reasoning）：模型的思考内容 */
+  reasoning?: string;
   step?: number;
   toolCount?: number;
 }
@@ -68,7 +72,9 @@ interface Bridge {
     phase: string;
     history: Array<{ role: string; content: string }>;
     workspace?: string | null;
-  }) => Promise<Envelope<{ reply: string }>>;
+  }) => Promise<Envelope<{ reply: string; aborted?: boolean }>>;
+  /** 暂停当前这一轮 */
+  stop: () => Promise<Envelope<unknown>>;
   approve: (id: string) => Promise<Envelope<unknown>>;
   reject: (id: string) => Promise<Envelope<unknown>>;
   remove: (id: string) => Promise<Envelope<unknown>>;
@@ -123,16 +129,28 @@ interface LiveTrace {
   t0: number;
 }
 
+/**
+ * 这一轮里的一个片段，按模型实际产出的顺序排。
+ *
+ * 以前把所有工具堆在一个 `.trace` 里放在气泡上方，读起来像「先把所有活干完再说」，
+ * 但模型其实是「说一句 → 调个工具 → 再看结果说一句」。所以改成有序片段：
+ * 文本段与工具段交错，界面照原样重放。
+ */
+type Segment =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; trace: LiveTrace };
+
 interface LiveRun {
   taskId: string;
   /** 这一轮用户说的话。history 要等结束才 push，所以重建时得单独记一份 */
   pendingInput: string;
   /** 等待态文案，随 step 更新 */
   thinking: string;
-  /** 累积的流式正文 */
-  reply: string;
+  /** 模型的思考链（reasoning 增量累积），可折叠展示 */
+  reasoning: string;
+  /** 按产出顺序排列的片段 */
+  segments: Segment[];
   started: number;
-  traces: LiveTrace[];
 }
 
 let liveRun: LiveRun | null = null;
@@ -163,6 +181,10 @@ interface Task {
   at: number;
   /** 老数据没有这个字段，读出来是 undefined，按"未选"处理 */
   workspace?: TaskWorkspace;
+  /** 最后一条回答的思考过程，重开任务时仍可展开 */
+  reasoning?: string;
+  /** 最后一条回答里调过的工具，按顺序 */
+  steps?: Array<{ name: string; args: string; ok?: boolean; ms?: number }>;
 }
 
 const TASK_KEY = 'toolforge.tasks';
@@ -459,15 +481,6 @@ function userTurn(text: string): HTMLElement {
   return turn;
 }
 
-/** AI 气泡：渲染成 Markdown；内容为模型输出，已过 DOMPurify */
-function botTurn(content = ''): HTMLElement {
-  const turn = el('div', 'turn turn-bot');
-  const body = el('div', 'msg-bot md');
-  body.innerHTML = content ? markdownToHtml(content) : '';
-  turn.appendChild(body);
-  return turn;
-}
-
 /**
  * 按任务重建对话区。
  *
@@ -489,7 +502,21 @@ function renderHistory(task: Task | null): void {
     const user = history[i];
     const bot = history[i + 1];
     if (user) inner.appendChild(userTurn(user.content));
-    if (bot) inner.appendChild(botTurn(bot.content || '（没有输出）'));
+    if (!bot) continue;
+
+    const turn = el('div', 'turn turn-bot');
+    // 思考过程只属于最后一轮：每次对话都会覆盖 task.reasoning / task.steps
+    const isLast = i + 1 === history.length - 1 && !live;
+    if (isLast && task?.reasoning) turn.appendChild(reasoningBlock(task.reasoning, false));
+    if (isLast) {
+      for (const s of task?.steps || []) {
+        turn.appendChild(traceChip({ name: s.name, args: s.args, ok: s.ok, ms: s.ms, t0: 0 }));
+      }
+    }
+    const body = el('div', 'msg-bot md');
+    body.innerHTML = bot.content ? markdownToHtml(bot.content) : '（没有输出）';
+    turn.appendChild(body);
+    inner.appendChild(turn);
   }
 
   if (live) {
@@ -502,33 +529,68 @@ function renderHistory(task: Task | null): void {
   scrollBottom();
 }
 
-/** 按 liveRun 的数据把「正在跑的这一轮」搭出来：轨迹徽章 + 等待态或半截正文 */
+/** 单个工具徽章：填充扫过 + 计时，结束转绿或抖动变红。移植自 ReactBits Call Chip */
+function traceChip(t: LiveTrace): HTMLElement {
+  const chip = el('div', `call-chip${t.ok === undefined ? ' running' : t.ok ? ' done' : ' fail'}`);
+  chip.dataset.t0 = String(t.t0);
+  const nm = el('span', 't-name');
+  nm.textContent = t.name;
+  const args = el('span', 't-args');
+  args.textContent = t.args;
+  const state = el('span', 't-state');
+  state.textContent = t.ok === undefined ? fmtElapsed(Date.now() - t.t0) : t.ok ? `✓ ${t.ms || 0}ms` : '✗ 失败';
+  chip.append(nm, args, state);
+  return chip;
+}
+
+/**
+ * 思考块：模型吐出的 reasoning 内容，默认折叠。
+ *
+ * 推理模型的思考链动辄几千字，全展开会把正片挤走；但用户又想看它怎么想的，
+ * 所以做成默认收起、点开可读。<details> 省掉一堆开合状态管理。
+ */
+function reasoningBlock(text: string, live: boolean): HTMLElement {
+  const box = el('details', 'reasoning');
+  // 还在跑的时候先展开，让用户看到「它在想」；跑完收起，别占地方
+  box.open = live;
+  const sum = el('summary');
+  sum.textContent = live ? '思考中…' : '思考过程';
+  const body = el('div', 'reasoning-body');
+  body.textContent = text;
+  box.append(sum, body);
+  return box;
+}
+
+/**
+ * 按 liveRun 的数据把「正在跑的这一轮」搭出来。
+ * 片段按模型产出顺序穿插：文字段与工具段交错，和真实对话流一致。
+ */
 function buildLiveTurn(live: LiveRun): HTMLElement {
   const turn = el('div', 'turn turn-bot live-turn');
-  const trace = el('div', 'trace');
-  for (const t of live.traces) {
-    const chip = el('div', `call-chip${t.ok === undefined ? ' running' : t.ok ? ' done' : ' fail'}`);
-    chip.dataset.t0 = String(t.t0);
-    const nm = el('span', 't-name');
-    nm.textContent = t.name;
-    const args = el('span', 't-args');
-    args.textContent = t.args;
-    const state = el('span', 't-state');
-    state.textContent =
-      t.ok === undefined ? fmtElapsed(Date.now() - t.t0) : t.ok ? `✓ ${t.ms || 0}ms` : '✗ 失败';
-    chip.append(nm, args, state);
-    trace.appendChild(chip);
+
+  if (live.reasoning) turn.appendChild(reasoningBlock(live.reasoning, true));
+
+  for (const seg of live.segments) {
+    if (seg.kind === 'tool') {
+      turn.appendChild(traceChip(seg.trace));
+      continue;
+    }
+    const bubble = el('div', 'msg-bot md');
+    if (seg.text) bubble.innerHTML = markdownToHtml(seg.text);
+    turn.appendChild(bubble);
   }
 
-  const bubble = el('div', 'msg-bot md');
-  if (live.reply) {
-    bubble.classList.add('streaming');
-    bubble.innerHTML = markdownToHtml(live.reply);
-  } else {
-    bubble.classList.add('typing');
+  // 最后一段还是工具（或压根没有文字），就补一个等待态，否则会出现「只有徽章没有文字」的空档
+  const last = live.segments[live.segments.length - 1];
+  if (!last || last.kind === 'tool') {
+    const bubble = el('div', 'msg-bot md typing');
     bubble.appendChild(thinkingBlock(live.thinking));
+    turn.appendChild(bubble);
+  } else {
+    // 最后一段是文字：挂上打字光标，表示还可能继续来
+    const bubbles = turn.querySelectorAll<HTMLElement>('.msg-bot');
+    bubbles[bubbles.length - 1]?.classList.add('streaming');
   }
-  turn.append(trace, bubble);
   return turn;
 }
 
@@ -561,7 +623,7 @@ async function refresh(): Promise<void> {
   const headModel = $<HTMLSpanElement>('#headModel');
   headModel.textContent = s.model;
   headModel.classList.toggle('unset', s.model === '未配置模型');
-  $<HTMLSpanElement>('#headTools').textContent = `${live.filter((t) => t.status === 'active').length} 件工具`;
+  $<HTMLSpanElement>('#headTools').textContent = `${s.toolCount} 件工具`;
   const home = $<HTMLSpanElement>('#homePath');
   home.textContent = s.home;
   home.title = s.home;
@@ -967,14 +1029,20 @@ function setBusy(v: boolean): void {
 
 function syncComposer(): void {
   const btn = $<HTMLButtonElement>('#sendBtn');
+  const stop = $<HTMLButtonElement>('#stopBtn');
   btn.disabled = busy;
   btn.title = busy ? '上一轮还在跑，等它结束' : '';
+  // 忙的时候露出「暂停」，用户随时能把跑偏的一轮掐掉
+  stop.hidden = !busy;
+  stop.disabled = false;
   $<HTMLTextAreaElement>('#input').placeholder = busy
     ? '上一轮还在跑…可以先切到别的任务'
     : phase === 'create'
       ? '描述你要造的工具，例如：抓取某个页面的标题'
       : '说说你要做什么…（Shift + Enter 换行）';
 }
+
+$<HTMLButtonElement>('#stopBtn').addEventListener('click', () => void stopRun());
 
 function shorten(s: string, n: number): string {
   return s && s.length > n ? s.slice(0, n) + '…' : s || '';
@@ -1048,13 +1116,89 @@ function showError(bubble: HTMLElement, message: string): void {
   bubble.textContent = message;
 }
 
+/**
+ * 一轮允许跑多久。
+ *
+ * 后端有自己的超时（单次请求 20s、脚本工具 30s），但整轮可能串很多步，
+ * 累起来仍可能卡死在某个角落（网络半开、SDK 解析异常）。一旦卡住，
+ * `busy` 会永远为 true，之后所有输入都被静默吞掉——用户看到的就是「输入框打不了字」。
+ * 所以这里留一道兜底：到点强制收尾，把控制权还给人。
+ *
+ * `?turnTimeout=3000` 可覆盖——自动化测试靠它在几秒内验证兜底真的成立。
+ * 走 URL 而不是脚本注入，是因为模块在页面脚本执行时就求值了，那时注入已经晚了。
+ */
+const turnTimeoutMs = (() => {
+  const raw = Number(new URLSearchParams(location.search).get('turnTimeout'));
+  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60 * 1000;
+})();
+let watchdog: number | null = null;
+
+function armWatchdog(taskId: string): void {
+  clearWatchdog();
+  watchdog = window.setTimeout(() => {
+    watchdog = null;
+    if (!liveRun || liveRun.taskId !== taskId) return;
+    // 让后端也停手，别在后台继续烧 token
+    void window.tf?.stop();
+    forceFinish(
+      taskId,
+      `这一轮跑了太久（${Math.round(turnTimeoutMs / 1000)} 秒），已自动停止。可以接着发消息，或拆小一点再试。`
+    );
+  }, turnTimeoutMs);
+}
+
+function clearWatchdog(): void {
+  if (watchdog !== null) {
+    clearTimeout(watchdog);
+    watchdog = null;
+  }
+}
+
+/**
+ * 强制收尾：不管请求那边还在不在，先把界面解锁。
+ * 和 send() 的正常收尾共用同一套清理，避免两边各写一份、日后改漏。
+ */
+function forceFinish(taskId: string, message: string): void {
+  const task = tasks.find((t) => t.id === taskId);
+  if (task && liveRun) {
+    const answer = liveRun.segments
+      .filter((s): s is { kind: 'text'; text: string } => s.kind === 'text')
+      .map((s) => s.text)
+      .join('')
+      .trim();
+    task.history.push(
+      { role: 'user', content: liveRun.pendingInput },
+      { role: 'assistant', content: answer || `（${message}）` }
+    );
+    task.history = task.history.slice(-8);
+    if (liveRun.reasoning) task.reasoning = liveRun.reasoning;
+  }
+  clearWatchdog();
+  stopTicker();
+  liveRun = null;
+  setBusy(false);
+  saveTasks();
+  if (activeId === taskId) renderHistory(currentTask());
+  scrollBottom();
+}
+
 async function send(text: string): Promise<void> {
-  if (busy || !text.trim()) return;
+  if (!text.trim()) return;
+  if (busy) {
+    // 静默 return 会让人以为输入框坏了。说清楚是「上一轮还在跑」，
+    // 并指出可以暂停——否则用户只能干等，看着像程序卡死。
+    const other = liveRun && liveRun.taskId !== activeId;
+    alert(
+      other
+        ? '另一条任务还在执行中。可以先暂停它（输入框右侧的「暂停」），或等它跑完。'
+        : '这一轮还在执行中。可以点「暂停」停下，或等它跑完。'
+    );
+    return;
+  }
   if (!window.tf) {
     alert('请在 Electron 中运行：pnpm start');
     return;
   }
-  setBusy(true);
   const task = ensureTask(text);
   task.at = Date.now();
   // 任务列表按最近活动排序
@@ -1066,21 +1210,24 @@ async function send(text: string): Promise<void> {
 
   inner.appendChild(userTurn(text));
 
-  // 一条 AI 回复里可能有多轮工具调用，trace 记在气泡上方
-  const turn = el('div', 'turn turn-bot');
-  const trace = el('div', 'trace');
-  const bubble = el('div', 'msg-bot md typing');
-  bubble.appendChild(thinkingBlock('思考中…'));
-  turn.append(trace, bubble);
-  inner.appendChild(turn);
-  startTicker();
-  scrollBottom();
-
   // 记成数据而不是抓着 DOM：用户随时可能切走，切回来要能照原样重建
-  liveRun = { taskId: task.id, pendingInput: text, thinking: '思考中…', reply: '', started: Date.now(), traces: [] };
+  liveRun = {
+    taskId: task.id,
+    pendingInput: text,
+    thinking: '思考中…',
+    reasoning: '',
+    segments: [],
+    started: Date.now(),
+  };
+  inner.appendChild(buildLiveTurn(liveRun));
+  setBusy(true);
+  startTicker();
+  armWatchdog(task.id);
+  scrollBottom();
 
   let streamed = '';
   let failed = '';
+  let aborted = false;
   try {
     const res = await window.tf.chat({
       input: text,
@@ -1092,6 +1239,7 @@ async function send(text: string): Promise<void> {
     if (res.ok) {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
       streamed = res.data.reply || '';
+      aborted = Boolean(res.data.aborted);
     } else {
       failed = res.error;
     }
@@ -1100,9 +1248,16 @@ async function send(text: string): Promise<void> {
   }
 
   // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失
-  task.history.push({ role: 'user', content: text }, { role: 'assistant', content: streamed });
+  const answer = streamed || (aborted ? '（已暂停）' : '');
+  task.history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
   task.history = task.history.slice(-8);
+  // 思考过程与工具轨迹一起留在任务上，重开也能看
+  if (liveRun?.reasoning) task.reasoning = liveRun.reasoning;
+  task.steps = [...(liveRun?.segments || [])]
+    .filter((s): s is { kind: 'tool'; trace: LiveTrace } => s.kind === 'tool')
+    .map((s) => ({ name: s.trace.name, args: s.trace.args, ok: s.trace.ok, ms: s.trace.ms }));
 
+  clearWatchdog();
   stopTicker();
   liveRun = null;
   setBusy(false);
@@ -1119,6 +1274,14 @@ async function send(text: string): Promise<void> {
     }
   }
   refresh();
+}
+
+/** 暂停当前这轮。后端会中止请求，chat() 带着 aborted=true 返回，走正常收尾 */
+async function stopRun(): Promise<void> {
+  if (!busy) return;
+  await window.tf?.stop();
+  // 按钮立刻变灰，别让用户连点；真正解锁在 send() 的收尾里
+  $<HTMLButtonElement>('#stopBtn').disabled = true;
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -1317,45 +1480,87 @@ if (window.tf) {
     // 用户可能已经切到别的任务；此时数据照收，但界面不碰
     const onScreen = activeId === liveRun.taskId;
 
-    if (event.type === 'tool_call') {
-      liveRun.traces.push({
-        name: event.name || '',
-        args: shorten(JSON.stringify(event.args || {}), 90),
-        t0: Date.now(),
-      });
-      if (onScreen) paintTrace();
-    } else if (event.type === 'tool_result') {
-      // 落定最后一条还在跑的工具
-      const last = [...liveRun.traces].reverse().find((t) => t.ok === undefined);
-      if (last) {
-        last.ok = Boolean(event.ok);
-        last.ms = event.ms;
+    if (event.type === 'reasoning' && event.reasoning) {
+      liveRun.reasoning += event.reasoning;
+      if (!onScreen) return;
+      // 思考块是纯文本累积，直接改文本比整轮重画便宜得多
+      const box = inner.querySelector<HTMLDetailsElement>('.live-turn .reasoning');
+      if (box) {
+        const body = box.querySelector('.reasoning-body');
+        if (body) body.textContent = liveRun.reasoning;
+      } else if (inner.querySelector('.live-turn')) {
+        paintAll();
       }
-      if (onScreen) paintTrace();
-    } else if (event.type === 'step') {
-      // 每一步开始时清空累积文本：前一步的内容多半是「我先查一下」，最终答案在最后一步
-      liveRun.reply = '';
+      return;
+    }
+
+    if (event.type === 'tool_call') {
+      liveRun.segments.push({
+        kind: 'tool',
+        trace: { name: event.name || '', args: shorten(JSON.stringify(event.args || {}), 90), t0: Date.now() },
+      });
+      if (onScreen) paintAll();
+      return;
+    }
+
+    if (event.type === 'tool_result') {
+      // 落定最后一条还在跑的工具
+      const tool = [...liveRun.segments]
+        .reverse()
+        .find((s): s is { kind: 'tool'; trace: LiveTrace } => s.kind === 'tool' && s.trace.ok === undefined);
+      if (tool) {
+        tool.trace.ok = Boolean(event.ok);
+        tool.trace.ms = event.ms;
+      }
+      if (onScreen) paintAll();
+      return;
+    }
+
+    if (event.type === 'step') {
+      // 新的一步：把半截文字收尾成独立片段，后续文字另起一段。
+      // 这样「先说一句 → 调工具 → 再说一句」会按真实顺序排下去，而不是全糊成一段。
+      sealTextSegment();
       liveRun.thinking = `思考中…（第 ${event.step} 步，${event.toolCount} 件工具在场）`;
       if (onScreen) setThinkingLabel(liveRun.thinking);
-    } else if (event.type === 'delta' && event.delta) {
-      liveRun.reply += event.delta;
+      return;
+    }
+
+    if (event.type === 'delta' && event.delta) {
+      const last = liveRun.segments[liveRun.segments.length - 1];
+      if (last && last.kind === 'text') last.text += event.delta;
+      else liveRun.segments.push({ kind: 'text', text: event.delta });
       if (!onScreen) return;
       queueReplyPaint();
     }
   });
 }
 
-/** 把 liveRun 的轨迹画到当前这一轮上（只在该任务可见时调用） */
-function paintTrace(): void {
-  const turn = inner.querySelector<HTMLElement>('.live-turn');
-  if (!turn || !liveRun) return;
-  const fresh = buildLiveTurn(liveRun).querySelector('.trace');
-  const old = turn.querySelector('.trace');
-  if (fresh && old) turn.replaceChild(fresh, old);
+/** 把当前开着的文字段封口，让下一段文字另起一个气泡 */
+function sealTextSegment(): void {
+  const last = liveRun?.segments[liveRun.segments.length - 1];
+  if (last && last.kind === 'text' && !last.text.trim()) {
+    // 只可能是空白，直接丢掉，免得留下空气泡
+    liveRun!.segments.pop();
+  }
+}
+
+/**
+ * 整轮重画。事件粒度是「工具、步骤」这类低频动作，重画一遍最省心；
+ * 高频的流式文字走 queueReplyPaint 增量更新，不会每片都重建。
+ */
+function paintAll(): void {
+  const old = inner.querySelector<HTMLElement>('.live-turn');
+  if (!old || !liveRun) return;
+  // 保留用户手动展开/收起思考块的意图
+  const wasOpen = old.querySelector<HTMLDetailsElement>('.reasoning')?.open;
+  const fresh = buildLiveTurn(liveRun);
+  const box = fresh.querySelector<HTMLDetailsElement>('.reasoning');
+  if (box && wasOpen !== undefined) box.open = wasOpen;
+  old.replaceWith(fresh);
   scrollBottom();
 }
 
-/** 流式正文按帧合并重画（每片都解析 Markdown 是 O(n²)） */
+/** 流式正文按帧合并重画最后一段文字（每片都解析 Markdown 是 O(n²)） */
 function queueReplyPaint(): void {
   if (renderQueued) return;
   renderQueued = true;
@@ -1363,15 +1568,11 @@ function queueReplyPaint(): void {
     renderQueued = false;
     const turn = inner.querySelector<HTMLElement>('.live-turn');
     if (!turn || !liveRun) return;
-    const bubble = turn.querySelector<HTMLElement>('.msg-bot');
-    if (!bubble) return;
-    if (bubble.classList.contains('typing')) {
-      // 首个增量到达就把等待块换成真内容，并挂上打字光标
-      bubble.classList.remove('typing');
-      bubble.classList.add('streaming');
-    }
-    bubble.innerHTML = markdownToHtml(liveRun.reply);
-    scrollBottom();
+    const last = liveRun.segments[liveRun.segments.length - 1];
+    if (!last || last.kind !== 'text') return;
+
+    // 整轮重画比「精确定位到最后一个气泡」更稳：片段数很少，代价可以忽略
+    paintAll();
   });
 }
 

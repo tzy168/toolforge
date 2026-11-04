@@ -131,7 +131,7 @@ export interface ExecuteOptions {
 }
 
 export interface AgentEvent {
-  type: 'step' | 'assistant' | 'tool_call' | 'tool_result' | 'delta';
+  type: 'step' | 'assistant' | 'tool_call' | 'tool_result' | 'delta' | 'reasoning';
   step?: number;
   toolCount?: number;
   content?: string;
@@ -143,6 +143,8 @@ export interface AgentEvent {
   payload?: unknown;
   /** 流式增量：type=delta 时是本片文本，前端追加 */
   delta?: string;
+  /** 推理增量：type=reasoning 时是本片思考内容，前端追加到可折叠的思考块里 */
+  reasoning?: string;
 }
 
 /** 给 UI 的瘦身版 */

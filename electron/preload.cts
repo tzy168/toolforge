@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron') as typeof import('ele
 contextBridge.exposeInMainWorld('tf', {
   state: () => ipcRenderer.invoke('tf:state'),
   chat: (payload: unknown) => ipcRenderer.invoke('tf:chat', payload),
+  stop: () => ipcRenderer.invoke('tf:stop'),
   approve: (id: string) => ipcRenderer.invoke('tf:approve', id),
   reject: (id: string) => ipcRenderer.invoke('tf:reject', id),
   remove: (id: string) => ipcRenderer.invoke('tf:remove', id),

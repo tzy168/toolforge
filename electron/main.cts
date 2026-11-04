@@ -35,7 +35,10 @@ function createWindow(): void {
     },
   });
   // 界面是纯 HTML/CSS/JS，不进编译流程，仍从源码目录加载
-  win.loadFile(path.resolve(__dirname, '..', '..', 'src', 'ui', 'index.html'));
+  const query: Record<string, string> = {};
+  // 允许测试把一轮的兜底超时调短，好在几秒内验证「卡住能自动解锁」
+  if (process.env.TF_TURN_TIMEOUT) query.turnTimeout = process.env.TF_TURN_TIMEOUT;
+  win.loadFile(path.resolve(__dirname, '..', '..', 'src', 'ui', 'index.html'), { query });
   win.once('ready-to-show', () => win?.show());
   win.on('closed', () => {
     win = null;
@@ -79,6 +82,7 @@ function guard<T extends unknown[]>(fn: (...args: T) => unknown) {
 
 ipcMain.handle('tf:state', guard(() => forge!.state()));
 ipcMain.handle('tf:chat', guard((_e: unknown, payload: Parameters<Forge['chat']>[0]) => forge!.chat(payload)));
+ipcMain.handle('tf:stop', guard(() => forge!.stop()));
 ipcMain.handle('tf:approve', guard((_e: unknown, id: string) => forge!.approve(id)));
 ipcMain.handle('tf:reject', guard((_e: unknown, id: string) => forge!.reject(id)));
 ipcMain.handle('tf:remove', guard((_e: unknown, id: string) => forge!.removeTool(id)));

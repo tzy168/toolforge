@@ -35,6 +35,8 @@ export interface ForgeState {
   /** 当前工作目录；null 表示还没选 */
   workspace: string | null;
   sessionId: string;
+  /** 此刻真正能用的工具数（元工具 + 已放行 + 本会话临时可用 + MCP），界面别自己数 */
+  toolCount: number;
   tools: ToolSummary[];
   pending: ToolSummary[];
   broken: Array<{ id: string; error: string }>;
@@ -49,7 +51,16 @@ export interface ChatResult {
   steps: number;
   ok: boolean;
   sessionId: string;
+  /** true 表示用户主动暂停，不是出错 */
+  aborted?: boolean;
 }
+
+/**
+ * 单轮对话的步数上限。
+ * 复杂任务常常要连着造好几件工具、再串起来跑，16 步很容易不够——用户看到的
+ * 就是「任务还没收束」。30 步是权衡：足够办完大多数事，又不至于跑失控烧太多 token。
+ */
+const MAX_STEPS = 30;
 
 function loadSettings(): Settings {
   try {
@@ -82,7 +93,12 @@ function loadSettings(): Settings {
   }
 }
 
-function metaAsTool(name: string, description: string, input: Record<string, unknown>): Tool {
+function metaAsTool(
+  name: string,
+  description: string,
+  input: Record<string, unknown>,
+  trust: Tool['trust'] = 'L0'
+): Tool {
   return {
     id: `meta:${name}`,
     name,
@@ -101,7 +117,7 @@ function metaAsTool(name: string, description: string, input: Record<string, unk
       updatedAt: new Date().toISOString(),
     },
     status: 'active',
-    trust: 'L0',
+    trust,
     sessionId: null,
   };
 }
@@ -139,6 +155,8 @@ export class ToolForge {
   seeded: string[] = [];
   private _client: OpenAI | null = null;
   private _clientId: string | null = null;
+  /** 当前这一轮的中止控制器。AbortSignal 用过就废，每轮 chat 开始都要新建一个 */
+  private _abort = new AbortController();
 
   constructor({ onEvent }: { onEvent?: (event: AgentEvent) => void } = {}) {
     ensureDirs();
@@ -316,7 +334,7 @@ export class ToolForge {
 
   /** 当前可注入的全量工具：元工具 + 已放行/本会话 + MCP */
   allTools(): Tool[] {
-    const metas = metaToolDefs.map((d) => metaAsTool(d.name, d.description, d.input));
+    const metas = metaToolDefs.map((d) => metaAsTool(d.name, d.description, d.input, d.trust));
     return [...metas, ...store.usable(this.sessionId), ...mcp.listTools()];
   }
 
@@ -368,6 +386,8 @@ export class ToolForge {
     workspace?: string | null;
   }): Promise<ChatResult> {
     if (workspace !== undefined) setWorkspaceDir(workspace);
+    // 每轮换一个新的控制器：上一轮的 signal 已经 aborted，复用会导致一开跑就被中止
+    this._abort = new AbortController();
     const messages: ChatMessage[] = [
       ...buildSystemMessages(phase, this.allTools(), getWorkspace()),
       ...history
@@ -392,10 +412,23 @@ export class ToolForge {
       toolProvider,
       runTool: (n, a) => this.runTool(n, a, 0),
       onEvent: this.onEvent,
-      maxSteps: phase === 'create' ? 20 : 16,
+      maxSteps: MAX_STEPS,
+      signal: this._abort.signal,
     });
 
-    return { reply: result.reply, steps: result.steps, ok: result.ok, sessionId: this.sessionId };
+    return {
+      reply: result.reply,
+      steps: result.steps,
+      ok: result.ok,
+      sessionId: this.sessionId,
+      aborted: result.aborted,
+    };
+  }
+
+  /** 暂停当前这一轮。不抛错，aborting 后 chat() 会带着 aborted=true 正常返回 */
+  stop(): void {
+    this._abort.abort();
+    audit.append({ type: 'chat_stop', by: 'human' });
   }
 
   approve(id: string): ForgeState {
@@ -444,6 +477,10 @@ export class ToolForge {
       },
       sessionId: this.sessionId,
       workspace: getWorkspace(),
+      // 「可用工具数」只数用户视角的工具：仓库里已放行 / 本会话临时可用的 + MCP。
+      // 内核元工具（list_tools / tool_search / create_tool）不给算——它们不是用户造的东西，
+      // 算进来会让顶栏数字和设置页的「工具仓库 N」对不上，看起来像数错了。
+      toolCount: store.usable(this.sessionId).length + mcp.listTools().length,
       tools: tools.map(summarize),
       pending: tools.filter((t) => t.status === 'pending').map(summarize),
       broken,
