@@ -142,7 +142,8 @@ export async function runLoop({
   toolProvider,
   runTool,
   onEvent = () => {},
-  maxSteps = 16,
+  // 与 index.ts 的 DEFAULT_MAX_STEPS 对齐：调用方不传时也别退回到一个更小的值
+  maxSteps = 120,
   signal,
 }: LoopOptions): Promise<LoopResult> {
   for (let step = 0; step < maxSteps; step++) {

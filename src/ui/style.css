@@ -819,6 +819,10 @@ body {
 }
 .reasoning[open] > summary::before { transform: rotate(90deg); }
 .reasoning > summary:hover { color: var(--muted); }
+/* 想完了：文案已经翻成「思考完成」，竖线和三角转绿，跟「还在想」一眼区分 */
+.reasoning.done { border-left-color: var(--green); }
+.reasoning.done > summary { color: var(--muted); }
+.reasoning.done > summary::before { color: var(--green); }
 .reasoning-body {
   font-size: var(--fs-xs);
   line-height: 1.8;
@@ -891,6 +895,51 @@ body {
   45% { transform: translateX(3px); }
   70% { transform: translateX(-2px); }
 }
+
+/* ---------- 工具调用分组（跑完自动收起，别占地方）---------- */
+/* 跑着时展开看进度，全跑完收成一行摘要：件数 + 总耗时 + 失败数 */
+.trace-group {
+  margin: 2px 0 8px;
+  border-left: 2px solid var(--line);
+  padding-left: 10px;
+  align-self: flex-start;
+  max-width: 100%;
+}
+.trace-group > summary {
+  font-size: var(--fs-xs);
+  font-family: ui-monospace, monospace;
+  color: var(--faint);
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+  list-style: none;
+}
+.trace-group > summary::-webkit-details-marker { display: none; }
+/* 跟思考块共用一套三角，视觉上统一 */
+.trace-group > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 5px;
+  font-size: 9px;
+  transition: transform 0.14s;
+}
+.trace-group[open] > summary::before { transform: rotate(90deg); }
+.trace-group > summary:hover { color: var(--muted); }
+/* 全部成功：竖线和三角转绿，扫一眼就知道这组没问题 */
+.trace-group.done { border-left-color: var(--green); }
+.trace-group.done > summary { color: var(--muted); }
+.trace-group.done > summary::before { color: var(--green); }
+/* 有失败：摘要直接标红，收起状态也漏不掉 */
+.trace-group.fail { border-left-color: var(--red); }
+.trace-group.fail > summary { color: var(--red); }
+.trace-group-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding-top: 2px;
+}
+/* 组内的徽章贴着排，别再各自留一大截外边距 */
+.trace-group-body .call-chip { margin: 3px 0; }
 
 /* ---------- 等待态（移植自 ReactBits Lattice Loader）---------- */
 /* 点阵按对角波次亮起，旁边是走动的秒表——看得出「在干活」而不是卡住了 */

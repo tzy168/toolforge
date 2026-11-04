@@ -26,6 +26,8 @@ export interface Settings {
   activeProvider?: string | null;
   /** Work 模式下选中的项目目录，重启后恢复 */
   workspace?: string | null;
+  /** 单轮对话的步数上限；不填用 DEFAULT_MAX_STEPS，填了也会被 MAX_STEPS_CAP 封顶 */
+  maxSteps?: number;
 }
 
 export interface ForgeState {
@@ -57,10 +59,35 @@ export interface ChatResult {
 
 /**
  * 单轮对话的步数上限。
+ *
  * 复杂任务常常要连着造好几件工具、再串起来跑，16 步很容易不够——用户看到的
- * 就是「任务还没收束」。30 步是权衡：足够办完大多数事，又不至于跑失控烧太多 token。
+ * 就是「任务还没收束」。30 步在干正经活（读几个文件 → 改一遍 → 跑起来验）时
+ * 也还是会撞顶，60 步碰上跨十几个文件的重构同样偏紧；而撞顶就得让用户重来一遍，
+ * 比多跑几步的代价大得多。
+ *
+ * 120 步是权衡：一轮里走完「摸清结构 → 改一串文件 → 跑测试 → 按报错再改几轮」
+ * 都在预算内，真跑飞了还有暂停按钮兜底，而且每步都得模型自己决定要不要继续，
+ * 不会闷头空转。
+ *
+ * 还嫌不够时不必改代码：settings.json 里加 `maxSteps`，或用环境变量
+ * TOOLFORGE_MAX_STEPS 临时压过（环境变量优先）。无论怎么填都封顶在 MAX_STEPS_CAP，
+ * 免得一个误配变成无限循环。
  */
-const MAX_STEPS = 30;
+const DEFAULT_MAX_STEPS = 120;
+/** 硬上限：settings.json / 环境变量填得再大也不越过这个值 */
+const MAX_STEPS_CAP = 500;
+
+/**
+ * 单轮真正生效的步数上限：环境变量 > settings.json > 默认值。
+ * 填了非法值（负数、NaN、0）就当没填——不要因为一个笔误把任务卡死在第一步。
+ */
+function resolveMaxSteps(settings: Settings): number {
+  const raw = process.env.TOOLFORGE_MAX_STEPS ?? settings.maxSteps;
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_MAX_STEPS;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_STEPS;
+  return Math.min(n, MAX_STEPS_CAP);
+}
 
 function loadSettings(): Settings {
   try {
@@ -412,7 +439,7 @@ export class ToolForge {
       toolProvider,
       runTool: (n, a) => this.runTool(n, a, 0),
       onEvent: this.onEvent,
-      maxSteps: MAX_STEPS,
+      maxSteps: resolveMaxSteps(this.settings),
       signal: this._abort.signal,
     });
 

@@ -148,8 +148,22 @@ interface LiveRun {
   thinking: string;
   /** 模型的思考链（reasoning 增量累积），可折叠展示 */
   reasoning: string;
+  /**
+   * 这一步的思考是否已经收尾。
+   *
+   * 模型一旦开始吐正文或调工具，思考就已经结束了；标签得当场从「思考中…」翻成
+   * 「思考完成」，不能挂着「思考中…」等整轮跑完。下一步重新吐思考时再翻回去。
+   */
+  reasoningDone: boolean;
   /** 按产出顺序排列的片段 */
   segments: Segment[];
+  /**
+   * 用户手动开合过的工具组：组序号 → 是否展开。
+   *
+   * 工具组默认「跑着展开、全跑完自动收起」。这个默认值每次都从数据算出来，
+   * 但用户点开过某一组时得记住他的意思，否则下一次重画又给合回去。
+   */
+  traceOpen: Map<number, boolean>;
   started: number;
 }
 
@@ -507,11 +521,11 @@ function renderHistory(task: Task | null): void {
     const turn = el('div', 'turn turn-bot');
     // 思考过程只属于最后一轮：每次对话都会覆盖 task.reasoning / task.steps
     const isLast = i + 1 === history.length - 1 && !live;
-    if (isLast && task?.reasoning) turn.appendChild(reasoningBlock(task.reasoning, false));
+    if (isLast && task?.reasoning) turn.appendChild(reasoningBlock(task.reasoning, 'past'));
     if (isLast) {
-      for (const s of task?.steps || []) {
-        turn.appendChild(traceChip({ name: s.name, args: s.args, ok: s.ok, ms: s.ms, t0: 0 }));
-      }
+      const traces: LiveTrace[] = (task?.steps || []).map((s) => ({ name: s.name, args: s.args, ok: s.ok, ms: s.ms, t0: 0 }));
+      // 回放出来的工具调用一律收起：历史记录里再摆一排徽章最占地方
+      if (traces.length) turn.appendChild(traceGroup(traces, 0, null));
     }
     const body = el('div', 'msg-bot md');
     body.innerHTML = bot.content ? markdownToHtml(bot.content) : '（没有输出）';
@@ -544,17 +558,88 @@ function traceChip(t: LiveTrace): HTMLElement {
 }
 
 /**
+ * 工具调用分组：连着跑的一串工具收进一个可折叠块。
+ *
+ * 一轮里模型常连着调七八件工具，徽章一个占一行，正片全被顶到屏幕外。所以：
+ * 跑着的时候展开（得看见谁在跑），全部落定就自动收起，只留一行摘要——
+ * 件数、总耗时、失败数都写在摘要里，收起也不丢信息，想看细节点开就行。
+ *
+ * `gid` 是组在一轮里的序号，用来查用户手动开合过的意思（见 LiveRun.traceOpen）。
+ * `live` 为 null 表示这组是历史回放，没有开合记忆，一律收起。
+ */
+function traceGroup(traces: LiveTrace[], gid: number, live: LiveRun | null): HTMLElement {
+  // 只调了一件工具：本来就只有一行，再套摘要反而占地儿，直接给徽章
+  if (traces.length === 1) return traceChip(traces[0]);
+
+  const running = traces.some((t) => t.ok === undefined);
+  const settled = traces.filter((t) => t.ok !== undefined).length;
+  const failed = traces.filter((t) => t.ok === false).length;
+  const total = traces.reduce((n, t) => n + (t.ms || 0), 0);
+
+  const box = el('details', `trace-group${running ? '' : failed ? ' fail' : ' done'}`);
+  // 自动默认值：还在跑就展开，跑完就收起
+  const auto = running;
+  box.open = live?.traceOpen.get(gid) ?? auto;
+  box.dataset.g = String(gid);
+  box.dataset.auto = auto ? '1' : '0';
+
+  const sum = el('summary');
+  sum.textContent = running
+    ? traces.length > 1
+      ? `工具调用中…（${settled}/${traces.length} 完成）`
+      : '工具调用中…'
+    : `已调用 ${traces.length} 件工具${total ? ` · 合计 ${fmtElapsed(total)}` : ''}${failed ? ` · ${failed} 件失败` : ''}`;
+  box.appendChild(sum);
+
+  const body = el('div', 'trace-group-body');
+  for (const t of traces) body.appendChild(traceChip(t));
+  box.appendChild(body);
+  return box;
+}
+
+/**
+ * 重画前把用户手动开合过的工具组记下来。
+ * 和自动默认值一致说明他没动过，就别存成意图——否则该自动收起的那组永远收不起来。
+ */
+function rememberTraceOpen(old: HTMLElement): void {
+  if (!liveRun) return;
+  old.querySelectorAll<HTMLDetailsElement>('details.trace-group').forEach((d) => {
+    const gid = Number(d.dataset.g);
+    if (!Number.isFinite(gid)) return;
+    if (d.open === (d.dataset.auto === '1')) liveRun!.traceOpen.delete(gid);
+    else liveRun!.traceOpen.set(gid, d.open);
+  });
+}
+
+/**
+ * 思考块的三种状态。
+ *
+ * thinking = 模型正在想；done = 这一步想完了（整轮可能还在跑工具）；
+ * past = 整轮已经结束，从 history 回放出来的。
+ */
+type ReasoningState = 'thinking' | 'done' | 'past';
+
+const REASONING_LABEL: Record<ReasoningState, string> = {
+  thinking: '思考中…',
+  done: '思考完成',
+  past: '思考过程',
+};
+
+/**
  * 思考块：模型吐出的 reasoning 内容，默认折叠。
  *
  * 推理模型的思考链动辄几千字，全展开会把正片挤走；但用户又想看它怎么想的，
  * 所以做成默认收起、点开可读。<details> 省掉一堆开合状态管理。
+ *
+ * 标签随状态走：想的时候是「思考中…」，一想完立刻翻成「思考完成」。
+ * 别等整轮结束才变——否则用户以为它还在想，其实早就在调工具了。
  */
-function reasoningBlock(text: string, live: boolean): HTMLElement {
-  const box = el('details', 'reasoning');
+function reasoningBlock(text: string, state: ReasoningState): HTMLElement {
+  const box = el('details', `reasoning${state === 'done' ? ' done' : ''}`);
   // 还在跑的时候先展开，让用户看到「它在想」；跑完收起，别占地方
-  box.open = live;
+  box.open = state !== 'past';
   const sum = el('summary');
-  sum.textContent = live ? '思考中…' : '思考过程';
+  sum.textContent = REASONING_LABEL[state];
   const body = el('div', 'reasoning-body');
   body.textContent = text;
   box.append(sum, body);
@@ -568,16 +653,28 @@ function reasoningBlock(text: string, live: boolean): HTMLElement {
 function buildLiveTurn(live: LiveRun): HTMLElement {
   const turn = el('div', 'turn turn-bot live-turn');
 
-  if (live.reasoning) turn.appendChild(reasoningBlock(live.reasoning, true));
+  // 想完了就写「思考完成」，别等整轮结束（结束态由 'past' 负责）
+  if (live.reasoning) {
+    turn.appendChild(reasoningBlock(live.reasoning, live.reasoningDone ? 'done' : 'thinking'));
+  }
 
-  for (const seg of live.segments) {
-    if (seg.kind === 'tool') {
-      turn.appendChild(traceChip(seg.trace));
+  // 连着调的几件工具合成一组（组序号用来记住用户手动开合过的意思）
+  let gid = 0;
+  for (let i = 0; i < live.segments.length; i++) {
+    if (live.segments[i].kind === 'text') {
+      const seg = live.segments[i] as { kind: 'text'; text: string };
+      const bubble = el('div', 'msg-bot md');
+      if (seg.text) bubble.innerHTML = markdownToHtml(seg.text);
+      turn.appendChild(bubble);
       continue;
     }
-    const bubble = el('div', 'msg-bot md');
-    if (seg.text) bubble.innerHTML = markdownToHtml(seg.text);
-    turn.appendChild(bubble);
+    const traces: LiveTrace[] = [];
+    while (i < live.segments.length && live.segments[i].kind === 'tool') {
+      traces.push((live.segments[i] as { kind: 'tool'; trace: LiveTrace }).trace);
+      i++;
+    }
+    i--; // 上面的 while 多走了一步，退回外层循环的下一格
+    turn.appendChild(traceGroup(traces, gid++, live));
   }
 
   // 最后一段还是工具（或压根没有文字），就补一个等待态，否则会出现「只有徽章没有文字」的空档
@@ -1124,12 +1221,15 @@ function showError(bubble: HTMLElement, message: string): void {
  * `busy` 会永远为 true，之后所有输入都被静默吞掉——用户看到的就是「输入框打不了字」。
  * 所以这里留一道兜底：到点强制收尾，把控制权还给人。
  *
+ * 步数上限提到 60 步后，一轮能跑的时间也变长了，兜底时间跟着放到 20 分钟：
+ * 否则正常的 40 多步任务会在半路被误杀。
+ *
  * `?turnTimeout=3000` 可覆盖——自动化测试靠它在几秒内验证兜底真的成立。
  * 走 URL 而不是脚本注入，是因为模块在页面脚本执行时就求值了，那时注入已经晚了。
  */
 const turnTimeoutMs = (() => {
   const raw = Number(new URLSearchParams(location.search).get('turnTimeout'));
-  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60 * 1000;
+  return Number.isFinite(raw) && raw > 0 ? raw : 20 * 60 * 1000;
 })();
 let watchdog: number | null = null;
 
@@ -1216,7 +1316,9 @@ async function send(text: string): Promise<void> {
     pendingInput: text,
     thinking: '思考中…',
     reasoning: '',
+    reasoningDone: false,
     segments: [],
+    traceOpen: new Map(),
     started: Date.now(),
   };
   inner.appendChild(buildLiveTurn(liveRun));
@@ -1482,6 +1584,8 @@ if (window.tf) {
 
     if (event.type === 'reasoning' && event.reasoning) {
       liveRun.reasoning += event.reasoning;
+      // 又在吐思考了（多半是下一步）：标签翻回「思考中…」
+      setReasoningDone(false, onScreen);
       if (!onScreen) return;
       // 思考块是纯文本累积，直接改文本比整轮重画便宜得多
       const box = inner.querySelector<HTMLDetailsElement>('.live-turn .reasoning');
@@ -1495,6 +1599,8 @@ if (window.tf) {
     }
 
     if (event.type === 'tool_call') {
+      // 开始调工具 = 刚才那段思考已经收尾
+      setReasoningDone(true, onScreen);
       liveRun.segments.push({
         kind: 'tool',
         trace: { name: event.name || '', args: shorten(JSON.stringify(event.args || {}), 90), t0: Date.now() },
@@ -1525,7 +1631,15 @@ if (window.tf) {
       return;
     }
 
+    if (event.type === 'assistant') {
+      // 这一步的正文已经吐完，思考早就结束了；兜个底，免得只走非流式时标签赖在「思考中…」
+      setReasoningDone(true, onScreen);
+      return;
+    }
+
     if (event.type === 'delta' && event.delta) {
+      // 开始吐正文，说明思考收尾了——用户等着看的是这一句，不是那句「思考中…」
+      setReasoningDone(true, onScreen);
       const last = liveRun.segments[liveRun.segments.length - 1];
       if (last && last.kind === 'text') last.text += event.delta;
       else liveRun.segments.push({ kind: 'text', text: event.delta });
@@ -1533,6 +1647,25 @@ if (window.tf) {
       queueReplyPaint();
     }
   });
+}
+
+/**
+ * 翻思考块的标签：thinking↔done。
+ *
+ * 「想完了」这件事不必等整轮结束——模型开始吐正文或调工具时就已经成立。
+ * 只改 summary 的文案和 done 类，不整轮重画：这一步可能反复发生（多步任务每步都想一次），
+ * 重画会把用户正在读的内容抖一下。切到别的任务时只记账、不碰 DOM，
+ * 因为此刻页面上的节点不属于这一轮。
+ */
+function setReasoningDone(done: boolean, onScreen: boolean): void {
+  if (!liveRun || liveRun.reasoningDone === done) return;
+  liveRun.reasoningDone = done;
+  if (!onScreen) return;
+  const box = inner.querySelector<HTMLDetailsElement>('.live-turn .reasoning');
+  if (!box) return; // 思考块还没画出来（比如这一轮压根没思考），下次重画自然带上
+  box.classList.toggle('done', done);
+  const sum = box.querySelector('summary');
+  if (sum) sum.textContent = done ? REASONING_LABEL.done : REASONING_LABEL.thinking;
 }
 
 /** 把当前开着的文字段封口，让下一段文字另起一个气泡 */
@@ -1551,8 +1684,9 @@ function sealTextSegment(): void {
 function paintAll(): void {
   const old = inner.querySelector<HTMLElement>('.live-turn');
   if (!old || !liveRun) return;
-  // 保留用户手动展开/收起思考块的意图
+  // 保留用户手动展开/收起思考块与工具组的意图
   const wasOpen = old.querySelector<HTMLDetailsElement>('.reasoning')?.open;
+  rememberTraceOpen(old);
   const fresh = buildLiveTurn(liveRun);
   const box = fresh.querySelector<HTMLDetailsElement>('.reasoning');
   if (box && wasOpen !== undefined) box.open = wasOpen;
