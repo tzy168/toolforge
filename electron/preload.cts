@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('tf', {
   reject: (id: string) => ipcRenderer.invoke('tf:reject', id),
   remove: (id: string) => ipcRenderer.invoke('tf:remove', id),
   setEnabled: (id: string, enabled: boolean) => ipcRenderer.invoke('tf:setEnabled', id, enabled),
+  setAllowUnvettedDeps: (allow: boolean) => ipcRenderer.invoke('tf:setDepPolicy', allow),
   saveProvider: (p: unknown) => ipcRenderer.invoke('tf:saveProvider', p),
   removeProvider: (id: string) => ipcRenderer.invoke('tf:removeProvider', id),
   setActiveProvider: (id: string | null) => ipcRenderer.invoke('tf:setActiveProvider', id),

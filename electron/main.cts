@@ -206,6 +206,8 @@ ipcMain.handle('tf:approve', guard((_e: unknown, id: string) => forge!.approve(i
 ipcMain.handle('tf:reject', guard((_e: unknown, id: string) => forge!.reject(id)));
 ipcMain.handle('tf:remove', guard((_e: unknown, id: string) => forge!.removeTool(id)));
 ipcMain.handle('tf:setEnabled', guard((_e: unknown, id: string, enabled: boolean) => forge!.setEnabled(id, enabled)));
+// 联网装依赖的总开关：这是一次显式授权，单独走一条 IPC，别混进「保存配置」
+ipcMain.handle('tf:setDepPolicy', guard((_e: unknown, allow: boolean) => forge!.setAllowUnvettedDeps(Boolean(allow))));
 ipcMain.handle('tf:saveProvider', guard((_e: unknown, p: unknown) => forge!.saveProvider(p as never)));
 ipcMain.handle('tf:removeProvider', guard((_e: unknown, id: string) => forge!.removeProvider(id)));
 ipcMain.handle('tf:setActiveProvider', guard((_e: unknown, id: string | null) => forge!.setActiveProvider(id)));

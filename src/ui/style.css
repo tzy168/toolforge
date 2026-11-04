@@ -508,6 +508,18 @@ body {
 
 .row { display: flex; gap: 8px; margin-bottom: 10px; }
 
+/* 依赖开关：跟输入框同一行，但勾选框不该被 flex 拉宽 */
+.dep-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  cursor: pointer;
+}
+.dep-toggle input { flex: none; margin: 0; cursor: pointer; }
+
 /* ---------- 关于 ---------- */
 .about-brand { display: flex; gap: 13px; align-items: flex-start; }
 .about-mark {

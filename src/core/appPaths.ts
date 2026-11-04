@@ -77,6 +77,22 @@ export function sharedDepsRoot(): string | null {
 }
 
 /**
+ * 白名单清单文件（包名 → 精确版本）。
+ *
+ * 和 sharedDepsRoot 分开查：清单可以跟着本机仓库走（开发态改 shared-deps.json 立刻生效），
+ * 而 node_modules 只有构建过才存在。界面要展示「白名单里有什么」时不该被后者挡住。
+ */
+export function whitelistFile(): string | null {
+  const candidates: string[] = [];
+  const res = resourcesDir();
+  if (res) candidates.push(path.join(res, 'shared-deps', 'shared-deps.json'));
+  candidates.push(path.join(appRootDir(), 'shared-deps.json'));
+  candidates.push(path.join(appRootDir(), 'vendor', 'shared-deps', 'shared-deps.json'));
+  for (const f of candidates) if (fs.existsSync(f)) return f;
+  return null;
+}
+
+/**
  * 随应用分发的 npm 入口。
  *
  * 打包后 process.execPath 是 ToolForge.exe，它同级只有 Electron 自己的运行时，

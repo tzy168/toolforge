@@ -119,6 +119,20 @@
               </div>
 
               <div class="group">
+                <h3>三方依赖</h3>
+                <p class="hint" id="depWhitelistLine"></p>
+                <label class="dep-toggle">
+                  <input type="checkbox" id="depNetToggle" />
+                  <span>允许联网安装白名单外的依赖</span>
+                </label>
+                <p class="hint" id="depPolicyLine"></p>
+                <p class="hint">
+                  白名单四条标准：纯 JS 无原生二进制 · 不带 install 脚本 · 传递依赖可控 · 精确版本。
+                  改 shared-deps.json 后重新构建才生效。
+                </p>
+              </div>
+
+              <div class="group">
                 <h3>运行环境</h3>
                 <p class="hint" id="sandboxLine"></p>
                 <p class="hint" id="mcpLine"></p>

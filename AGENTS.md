@@ -16,6 +16,13 @@ pnpm test             # 先 build，再跑 dist/test/loop.test.js
 pnpm selftest         # 端到端自检：造工具全链路 13 个断言，CI 里最好也跑
 pnpm start            # Electron 桌面端
 pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit）
+
+# 依赖白名单 / 打包 / 安装包（细节见下面「三方依赖」「打包与安装包」两节）
+pnpm shared:deps      # 把 shared-deps.json 落成 vendor/shared-deps（开发态也需要）
+pnpm verify:whitelist # 白名单五条标准逐条验（含双运行时 require）
+pnpm curate:deps      # 候选包体检，给出「可加入 / 需人工判断 / 拒绝」
+pnpm pack:desktop     # 绿色目录产物
+pnpm installer        # 单文件安装包
 ```
 
 跑单个测试文件：`pnpm build && node --test dist/test/loop.test.js`。
@@ -33,6 +40,8 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 | `src/core/permissions.ts` | 域名/路径/环境变量白名单判定 |
 | `src/core/retrieve.ts` | 两级召回，只把相关工具 schema 注入模型 |
 | `src/core/models.ts` | 多模型服务商：DeepSeek/Kimi 预设、自定义合并、选中判定 |
+| `src/core/deps.ts` | 三方依赖：规格校验、白名单规划、宿主代装、体积/原生模块校验、联网开关策略 |
+| `src/core/appPaths.ts` | 程序自身位置：开发态/打包态判定、随包白名单与随包 npm 的候选路径 |
 | `src/core/{template,audit,pack,seed}.ts` | 占位符取值、审计日志、工具包导入导出、种子工具 |
 | `src/core/paths.ts` | 目录常量、`@workspace` 工作目录状态、BOM 安全的 JSON 读取 |
 | `src/executors/declarative.ts` | http / transform / shell / compose 四种声明式实现 |
@@ -42,6 +51,10 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 | `src/mcp/client.ts` | 可选 MCP 适配器，SDK 没装也要能开机 |
 | `src/ui/` | 纯 HTML/CSS/JS 渲染层，`app.ts` 只经 `window.tf` 通信；`vendor.d.ts` 声明 marked/dompurify。等待/工具徽章等动效是纯 CSS，视觉参考 ReactBits 但没有引入 React |
 | `scripts/copy-ui-vendor.mjs` | 构建时把 marked / dompurify 的 ESM 产物拷到 `src/ui/build/vendor/`（CSP 禁 CDN，界面无打包器） |
+| `scripts/{build-shared-deps,verify-whitelist,curate-shared-deps}.mjs` + `whitelist-lib.mjs` | 离线白名单的构建、验收、候选体检。三者共用同一份装法，避免「构建的」和「验收的」不是同一棵树 |
+| `scripts/build-desktop.mjs` | 手工组装可双击的桌面产物（不依赖 electron-builder） |
+| `scripts/{build-installer.mjs,installer-stub.cs}` | 自解压安装包：csc 编译桩 + 拼在其后的 zip 负载 |
+| `shared-deps.json` | 离线依赖白名单（包名 → 精确版本）与入包标准 |
 | `electron/` | `main.cts` 主进程 + IPC handler，`preload.cts` 桥接白名单 |
 | `bin/cli.ts` | REPL 与 `--selftest` |
 | `bin/start.cts` | 启动器：剔除 `ELECTRON_RUN_AS_NODE` 再拉 Electron |
@@ -61,6 +74,7 @@ pnpm cli              # 终端 REPL（/work /create /tools /approve <id> /exit�
 11. **「工具能不能用」只有一处判定**：`store.isUsable(tool, sessionId)`。`store.usable()` 与 `executeTool` 都调它，别再各写一遍条件。
 12. **同名重建自动升 patch 版本**（`store.save` 里的 `bumpPatch`），旧规格先落 `.history/` 快照；`store.patch()` 只改状态、传 `bump: false` 不升版本。
 13. **参数校验器的缓存键要带 schema**。同名工具重建后 schema 会变，只按名字缓存会把旧校验器套到新规格上。
+14. **依赖只能声明，不能自己装**。工具的 `impl.deps` 走宿主代装，且只有 `script` 类能有依赖；给 agent 加「自己跑 npm install」的口子等于把任意代码执行的开头那一步交出去。
 
 ## 加一种新工具类型（kind）
 
@@ -110,7 +124,62 @@ untested ──用例通过、低危──> active
 - 改动设置页「工具仓库」的等级 tab / 名称搜索时，跑 `pnpm verify:toolfilter`：它在真实界面里点 tab、敲搜索框，断言等级筛选、模糊搜索、两者叠加、空状态与「刷新后条件不丢」共 12 项。
 - 改动渲染层的任务切换 / 流式渲染时，跑 `pnpm verify:switch`：它起一个假模型服务，自动走一遍「发送 → 切走 → 切回 → 暂停 → 历史续聊 → 卡死超时解锁」，共 16 项断言。改这块之前先跑一次，确认基线是绿的。
 
+## 三方依赖
+
+工具可以声明需要哪些三方包，但只能「声明」，不能自己装：`impl.deps = { "dayjs": "1.11.13" }`。
+版本必须精确（拒绝 `^ ~ * latest git: file:`）——同一件工具半年后重装，装出来的必须是同一份代码。
+安装由宿主代装（`src/core/deps.ts`），全程 `--ignore-scripts`，含 `.node` 的原生模块直接拒绝并抛错。
+
+两条通道，按顺序尝试：
+
+| 通道 | 触发条件 | 标注 |
+| --- | --- | --- |
+| 离线白名单复制 | `shared-deps.json` 里有同名同版本 | `manager=shared` / `source=whitelist` |
+| 联网安装 | 白名单未命中，且用户开了联网开关 | `manager=npm` / `source=network` |
+
+**联网开关默认关闭**（`settings.json` 的 `allowUnvettedDeps`，或环境变量 `TOOLFORGE_ALLOW_NET_DEPS=1`，环境变量优先且可填 0 强行关）。
+关闭时白名单外的依赖**既不装也不跑用例**，直接落 `pending` + L3：跑用例就是执行代码，不能先执行再问用户。
+开关只能由人在设置页点，`ToolForge.setAllowUnvettedDeps()` 会落一条 `deps_policy` 审计——**别让 agent 能改它**。
+
+白名单进包要过五条标准（`pnpm verify:whitelist` 逐条验，一条不过就退出非零）：
+
+1. 精确版本
+2. registry 上没有 `install` / `preinstall` / `postinstall`
+3. 未废弃、不含原生二进制（`gypfile` / `binary` / `os` / `cpu`）
+4. 落盘后无 `.node`、闭包 ≤ 60 个包、总量 ≤ 20MB
+5. `require` 在系统 Node **和** Electron 内置 Node（20.18.3）下都成功
+
+第 5 条是唯一必须实测的一条：Node 22 支持 `require()` 加载 ESM，20.18 不支持。
+`uuid@14`、`marked@18`、`nanoid@6`、`he@2` 这些 ESM-only 包在开发机上一切正常，到打包版全是 `ERR_REQUIRE_ESM`。
+所以白名单里 `uuid` / `marked` / `he` 用的是仍提供 CJS 的旧主版本，`uuid` 最终被淘汰（≤9 已废弃）。
+
+要加包，按这个顺序：
+
+```bash
+pnpm curate:deps <pkg[@ver]...>   # 默认真装 + 双运行时 require，给结论；不改任何文件
+pnpm shared:deps                  # 落成 vendor/shared-deps
+pnpm verify:whitelist             # 五条标准全过才算数
+```
+
+`vendor/shared-deps/` 是构建产物（已 gitignore）。**干净 clone 之后要跑一次 `pnpm shared:deps`**，
+否则开发态没有白名单，agent 造带依赖的工具会一律判 L3 落 pending——那不是 bug，是没构建。
+
+## 打包与安装包
+
+```bash
+pnpm pack:desktop   # release/ToolForge-win32-x64（绿色目录，双击即用）
+pnpm verify:pack    # 真拉起打包后的 exe：白名单通道 + 随包 npm 联网通道各跑一遍
+pnpm installer      # release/ToolForge-Setup-<版本>.exe（单文件自解压）
+```
+
+安装包不用 electron-builder：它在 Windows 上要从 github.com 拉 nsis / winCodeSign，本机 GitHub 不通；
+本机也没有 makensis、没有 7z 的 SFX 模块。所以走 `scripts/installer-stub.cs`（用 .NET Framework 的 csc 编译的自解压桩）
++ 拼在其后的 zip 负载。桩支持 `/S` 静默、`/D=<目录>` 指定安装位置，装完写桌面与开始菜单快捷方式，并留一个卸载批处理。
+
+产物是**未签名**的，SmartScreen 会提示未知发布者——签名需要代码签名证书，目前没有，别在文档里承诺「无警告」。
+
 ## 常见坑
+
 
 - **配置文件一律用 `readJsonFile()` 读**（`core/paths.ts`）。它剥掉 UTF-8 BOM——Windows 记事本 / PowerShell 存文件默认带 BOM，`JSON.parse` 见到就抛错，上层会当成"文件损坏"。`loadSettings` 在这种情况会先把原文备份成 `settings.json.broken-<时间戳>` 再重建，**绝不静默覆盖用户配置**。
 - **Windows 下 npx/npm/pnpm 是 `.cmd`**，MCP 连接必须经 `cmd /c` 转一手（`src/mcp/client.ts` 已处理）。

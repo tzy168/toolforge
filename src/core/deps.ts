@@ -10,12 +10,19 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { toolDir } from './paths.js';
-import { bundledNpmCli, sharedDepsRoot } from './appPaths.js';
-import type { DepRecord, InstalledDep, Tool, ToolDeps } from '../types.js';
+import { dirs, readJsonFile, toolDir } from './paths.js';
+import { bundledNpmCli, sharedDepsRoot, whitelistFile } from './appPaths.js';
+import type { DepRecord, DepSource, InstalledDep, Tool, ToolDeps } from '../types.js';
 
-/** 装进来的 node_modules 总大小上限 */
-export const MAX_TOTAL_BYTES = 5 * 1024 * 1024;
+/**
+ * 装进来的 node_modules 总大小上限。
+ *
+ * 原来定在 5MB，实际用起来才发现它卡的不是安全、是可用性：zod 4（5.9MB）、
+ * date-fns（10.4MB）这类「零依赖、纯 JS、几千万人在用」的包全被挡在门外，
+ * 而真正该拦的东西（一个包拖进两百个包）由包数上限管着。
+ * 20MB 足够放下任何单文件库，又不至于让一件工具的依赖比应用本身还大。
+ */
+export const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
 /** 传递依赖包数上限：一个包拖进两百个包的情况不该出现在工具沙箱里 */
 export const MAX_TRANSITIVE = 60;
 /** 单次安装超时 */
@@ -26,6 +33,8 @@ export interface DepInstallReport {
   /** 一件无依赖的工具也会返回 ok，此时 skipped=true */
   skipped: boolean;
   manager: string;
+  /** 这份依赖从哪来：白名单复制 或 联网安装 */
+  source: DepSource;
   installed: InstalledDep[];
   totalBytes: number;
   transitiveCount: number;
@@ -230,6 +239,76 @@ function readIntegrity(nodeModules: string, deps: ToolDeps): InstalledDep[] {
   });
 }
 
+
+/* ---------------- 依赖策略：谁能装、能不能联网 ---------------- */
+
+export interface DepPolicy {
+  /** 是否允许安装离线白名单之外的包（会联网）。默认 false */
+  allowUnvettedDeps: boolean;
+  /** 白名单目录（内含 node_modules）；null 表示当前形态下没有 */
+  sharedDepsRoot: string | null;
+  /** 白名单声明的包名 → 精确版本；读不到文件时为 {} */
+  whitelist: ToolDeps;
+  /** 这个开关是谁打开的：环境变量 / settings.json / 没开 */
+  origin: 'env' | 'settings' | 'default';
+}
+
+/** 白名单清单文件里声明的包。界面要展示「白名单里有什么」，不该依赖 node_modules 是否已构建 */
+export function whitelistVersions(): ToolDeps {
+  const file = whitelistFile();
+  if (!file) return {};
+  try {
+    const raw = readJsonFile(file) as { packages?: unknown };
+    const pkgs = raw?.packages;
+    if (!pkgs || typeof pkgs !== 'object') return {};
+    const out: ToolDeps = {};
+    for (const [k, v] of Object.entries(pkgs as Record<string, unknown>)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+    return out;
+  } catch {
+    // 清单坏了就当白名单是空的：宁可退化成「必须人工放行」，不可退化成「什么都能装」
+    return {};
+  }
+}
+
+/**
+ * 联网装依赖的总开关。
+ *
+ * 默认关。开发机上没有随包白名单，关了就等于「agent 造不出带依赖的工具」，所以需要一条
+ * 人工开的口子；但这条口子必须是一次显式动作，不能被某次调用顺手打开——
+ * 它一旦打开，registry 上的代码就会进到本机并且被执行（跑用例）。
+ *
+ * 优先级：环境变量 > settings.json > 默认关。环境变量可以填 0 强行关掉，
+ * 这样既能临时放行，也能在服务化部署里压过用户配置。
+ */
+export function readDepPolicy(): DepPolicy {
+  const envRaw = (process.env.TOOLFORGE_ALLOW_NET_DEPS ?? '').trim().toLowerCase();
+  let allow = false;
+  let origin: DepPolicy['origin'] = 'default';
+  if (envRaw === '1' || envRaw === 'true') {
+    allow = true;
+    origin = 'env';
+  } else if (envRaw === '0' || envRaw === 'false') {
+    allow = false;
+    origin = 'env';
+  } else {
+    try {
+      const s = readJsonFile(dirs.settings) as { allowUnvettedDeps?: unknown };
+      if (s?.allowUnvettedDeps === true) {
+        allow = true;
+        origin = 'settings';
+      }
+    } catch {
+      // settings.json 不存在或坏了：当没开。这里绝不能「读失败就放行」
+    }
+  }
+  return { allowUnvettedDeps: allow, sharedDepsRoot: sharedDepsRoot(), whitelist: whitelistVersions(), origin };
+}
+
+export function networkDepsAllowed(): boolean {
+  return readDepPolicy().allowUnvettedDeps;
+}
 /* ---------------- 随包分发的预装依赖：离线安装通道 ---------------- */
 
 export interface SharedDepPlan {
@@ -373,6 +452,7 @@ export function installSharedDeps(tool: Tool, plan: SharedDepPlan): DepInstallRe
       ok: true,
       skipped: false,
       manager: 'shared',
+      source: 'whitelist',
       installed: plan.hits,
       totalBytes: stats.bytes,
       transitiveCount: stats.packages,
@@ -399,7 +479,7 @@ export async function installToolDeps(tool: Tool, opts: { force?: boolean } = {}
     throw new Error(`只有 script 类工具需要装依赖，${tool.name} 是 ${tool.kind}`);
   }
   if (names.length === 0) {
-    return { ok: true, skipped: true, manager: '-', installed: [], totalBytes: 0, transitiveCount: 0, ms: 0 };
+    return { ok: true, skipped: true, manager: '-', source: 'whitelist', installed: [], totalBytes: 0, transitiveCount: 0, ms: 0 };
   }
   if (!opts.force && depsReady(tool)) {
     const rec = tool.meta?.deps;
@@ -407,6 +487,7 @@ export async function installToolDeps(tool: Tool, opts: { force?: boolean } = {}
       ok: true,
       skipped: true,
       manager: rec?.manager ?? 'cached',
+      source: rec?.source ?? 'whitelist',
       installed: rec?.packages ?? [],
       totalBytes: rec?.totalBytes ?? 0,
       transitiveCount: rec?.transitiveCount ?? 0,
@@ -509,6 +590,7 @@ export async function installToolDeps(tool: Tool, opts: { force?: boolean } = {}
       ok: true,
       skipped: false,
       manager: manager.label,
+      source: 'network',
       installed,
       totalBytes: stats.bytes,
       transitiveCount: stats.packages,
@@ -525,6 +607,7 @@ export function toDepRecord(report: DepInstallReport): DepRecord {
   return {
     at: new Date().toISOString(),
     manager: report.manager,
+    source: report.source,
     packages: report.installed,
     totalBytes: report.totalBytes,
     transitiveCount: report.transitiveCount,

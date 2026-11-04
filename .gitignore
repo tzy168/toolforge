@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+vendor/shared-deps/
 .pack-cache/
 src/ui/build/
 .shot.png

@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import * as audit from '../core/audit.js';
 import { WORKSPACE_ROOT } from '../core/paths.js';
-import { planSharedDeps } from './deps.js';
+import { planSharedDeps, readDepPolicy } from './deps.js';
 import type { Finding, Grade, TestResult, Tool } from '../types.js';
 
 // 静态扫描：只看代码里那些「不该出现」的痕迹。不是完备防御，是筛子。
@@ -51,54 +51,75 @@ export function grade(tool: Tool, findings: Finding[] = []): Grade {
   const hasHigh = findings.some((f) => f.level === 'high');
 
   // 三方依赖：它改变的是「代码从哪来」，不是「工具能做什么」。
-  // 所以命中离线白名单时只记一笔、不动级别；命中不了就直接 L3 ——
-  // 联网把一份没人审过的代码拉进用户机器，这个决定只能由人来下。
+  //
+  // 命中离线白名单 → 只记一笔、不动级别（白名单进过一次人工审核）。
+  // 没命中 → 级别钉死在 L3，理由分两种：
+  //   a) 用户开了 allowUnvettedDeps：会联网装并执行，来源未经本项目审核；
+  //   b) 没开：压根不装也不跑用例，等人工决定。
+  //
+  // 两种情况都不在这里 return。早返回会让 reasons 里只剩依赖一条，
+  // 用户看到的就是「它要装个包」而不知道「它还能删文件」——那放行等于闭眼签字。
   const depNames = Object.keys(tool.impl?.deps ?? {});
   let depNote: string | null = null;
+  let depBlocks = false;
   if (depNames.length) {
     const plan = planSharedDeps(tool);
     if (plan && plan.missing.length === 0) {
-      depNote = `依赖 ${depNames.length} 个三方包，全部命中离线白名单：${depNames.join(', ')}`;
+      depNote = '依赖 ' + depNames.length + ' 个三方包，全部命中离线白名单：' + depNames.join(', ');
     } else {
+      depBlocks = true;
       const missing = plan ? plan.missing : depNames;
-      const why = plan ? '不在离线白名单内' : '本机没有离线白名单目录';
-      reasons.push(
-        `依赖 ${missing.length} 个白名单外的三方包（${missing.join(', ')}，${why}）：装它等于把未经审核的外部代码拉进本机`
-      );
-      return { level: 'L3', needsHuman: true, approved: false, reasons };
+      const policy = readDepPolicy();
+      if (policy.allowUnvettedDeps) {
+        reasons.push(
+          '依赖 ' + missing.length + ' 个白名单外的三方包（' + missing.join(', ') + '）：会联网安装并执行，' +
+            '代码来自 registry、未经本项目审核（联网开关当前由 ' + policy.origin + ' 打开）'
+        );
+      } else {
+        const why = plan ? '不在离线白名单内' : '本机没有离线白名单目录';
+        reasons.push(
+          '依赖 ' + missing.length + ' 个白名单外的三方包（' + missing.join(', ') + '，' + why + '）：' +
+            '装它等于把未经审核的外部代码拉进本机'
+        );
+      }
     }
   }
   const withDeps = (list: string[]): string[] => (depNote ? [...list, depNote] : list);
+  // depBlocks 时一律 L3 + 人工；其它维度照常算，好让 reasons 完整
+  const finish = (level: Grade['level'], needsHuman: boolean, approved: boolean): Grade =>
+    depBlocks
+      ? { level: 'L3', needsHuman: true, approved: false, reasons: withDeps(reasons) }
+      : { level, needsHuman, approved, reasons: withDeps(reasons) };
 
   if (hasHigh) {
     const hits = [...new Set(findings.filter((f) => f.level === 'high').map((f) => f.msg))];
-    reasons.push(`静态扫描命中高危：${hits.join('；')}`);
-    return { level: 'L3', needsHuman: true, approved: false, reasons: withDeps(reasons) };
+    reasons.push('静态扫描命中高危：' + hits.join('；'));
+    return finish('L3', true, false);
   }
 
   if (tool.kind === 'shell' || p.exec) {
     reasons.push('可执行外部命令');
-    return { level: 'L3', needsHuman: true, approved: false, reasons: withDeps(reasons) };
+    return finish('L3', true, false);
   }
 
   if (p.fsWrite?.length || p.env?.length) {
-    if (p.fsWrite?.length) reasons.push(`可写文件：${p.fsWrite.join(', ')}`);
-    if (p.env?.length) reasons.push(`可读密钥：${p.env.join(', ')}`);
+    if (p.fsWrite?.length) reasons.push('可写文件：' + p.fsWrite.join(', '));
+    if (p.env?.length) reasons.push('可读密钥：' + p.env.join(', '));
     // 写工作目录等于能改用户的项目源码，比写工具自己的 .data 危险得多，必须说清楚
     if (p.fsWrite?.includes(WORKSPACE_ROOT)) reasons.push('可写工作目录（会改动用户项目里的文件）');
-    return { level: 'L2', needsHuman: true, approved: false, reasons: withDeps(reasons) };
+    return finish('L2', true, false);
   }
 
   if (p.net?.length || p.fsRead?.length || tool.kind === 'script') {
-    if (p.net?.length) reasons.push(`可访问网络：${p.net.join(', ')}`);
-    if (p.fsRead?.length) reasons.push(`可读文件：${p.fsRead.join(', ')}`);
+    if (p.net?.length) reasons.push('可访问网络：' + p.net.join(', '));
+    if (p.fsRead?.length) reasons.push('可读文件：' + p.fsRead.join(', '));
     if (p.fsRead?.includes(WORKSPACE_ROOT)) reasons.push('可读工作目录（会看到用户项目的源码）');
     if (tool.kind === 'script') reasons.push('需在沙箱内执行代码');
-    return { level: 'L1', needsHuman: false, approved: true, reasons: withDeps(reasons) };
+    return finish('L1', false, true);
   }
 
   reasons.push('无任何权限，仅做纯计算');
-  return { level: 'L0', needsHuman: false, approved: true, reasons: withDeps(reasons) };
+  return finish('L0', false, true);
 }
 
 export interface ExampleReport {

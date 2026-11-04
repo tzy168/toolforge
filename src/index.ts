@@ -9,6 +9,7 @@ import { installSeeds } from './core/seed.js';
 import { metaToolDefs, findMetaTool } from './agent/meta-tools.js';
 import { buildSystemMessages, META_TOOL_NAMES, type Phase, type ChatMessage } from './agent/prompts.js';
 import { runLoop, createClient, type ToolBundle } from './agent/loop.js';
+import { planSharedDeps, readDepPolicy } from './core/deps.js';
 import { permissionSupport } from './executors/script.js';
 import { mcp } from './mcp/client.js';
 import { exportPack, savePack, importPack, readPackFile, type Pack, type ImportResult } from './core/pack.js';
@@ -28,6 +29,13 @@ export interface Settings {
   workspace?: string | null;
   /** 单轮对话的步数上限；不填用 DEFAULT_MAX_STEPS，填了也会被 MAX_STEPS_CAP 封顶 */
   maxSteps?: number;
+  /**
+   * 是否允许联网安装白名单外的三方依赖。默认 false。
+   *
+   * 打开它意味着「registry 上的代码可以进到本机并被执行（跑用例）」，
+   * 所以只能由用户在设置页显式点一次，绝不能由 agent 自己改。
+   */
+  allowUnvettedDeps?: boolean;
 }
 
 export interface ForgeState {
@@ -45,6 +53,8 @@ export interface ForgeState {
   mcp: { available: boolean; status: Record<string, string>; count: number };
   /** 脚本沙箱的 OS 级隔离是否真的能用。probed=false 表示还没跑过脚本工具，不能声称已启用 */
   sandbox: { probed: boolean; flag: string | null };
+  /** 三方依赖策略：界面据此展示「能不能联网装」与白名单内容 */
+  depPolicy: { allowUnvettedDeps: boolean; origin: string; sharedDepsRoot: string | null; whitelist: string[] };
   audit: audit.AuditEvent[];
 }
 
@@ -172,6 +182,26 @@ function summarize(t: Tool): ToolSummary {
         }
       : null,
     source: t.meta?.source || 'unknown',
+    deps: describeDeps(t),
+  };
+}
+
+/**
+ * 把一件工具的依赖状况整理成界面能直接用的形状。
+ *
+ * missing 的语义要小心区分：plan 为 null 表示「本机压根没有白名单目录」（开发态未构建），
+ * 此时不能声称「这些包不在白名单里」——那会让人去改 shared-deps.json 白折腾。
+ */
+function describeDeps(t: Tool): ToolSummary['deps'] {
+  const declared = t.impl?.deps ?? {};
+  const names = Object.keys(declared);
+  const pool = readDepPolicy();
+  const plan = names.length ? planSharedDeps(t) : null;
+  return {
+    declared,
+    installed: t.meta?.deps ?? null,
+    missing: !names.length ? [] : plan ? plan.missing : names,
+    whitelistRoot: pool.sharedDepsRoot,
   };
 }
 
@@ -452,6 +482,20 @@ export class ToolForge {
     };
   }
 
+  /**
+   * 显式开关「联网安装白名单外依赖」。
+   *
+   * 为什么必须是人点的：打开它之后，agent 造工具声明的依赖会立刻联网下载并执行。
+   * 把它做成 settings 里一个由 UI 调用的独立方法，是为了让这次授权在审计里留下明确的一条，
+   * 而不是混在「保存配置」里被顺手改掉。
+   */
+  setAllowUnvettedDeps(on: boolean): ForgeState {
+    this.settings.allowUnvettedDeps = Boolean(on);
+    this.persist();
+    audit.append({ type: 'deps_policy', allowUnvettedDeps: Boolean(on), by: 'human' });
+    return this.state();
+  }
+
   /** 暂停当前这一轮。不抛错，aborting 后 chat() 会带着 aborted=true 正常返回 */
   stop(): void {
     this._abort.abort();
@@ -494,6 +538,7 @@ export class ToolForge {
 
   state(): ForgeState {
     const { tools, broken } = store.list({ includeBroken: true });
+    const pool = readDepPolicy();
     return {
       home: dirs.home,
       model: this.model,
@@ -513,6 +558,12 @@ export class ToolForge {
       broken,
       mcp: { available: mcp.available, status: mcp.status, count: mcp.listTools().length },
       sandbox: permissionSupport(),
+      depPolicy: {
+        allowUnvettedDeps: pool.allowUnvettedDeps,
+        origin: pool.origin,
+        sharedDepsRoot: pool.sharedDepsRoot,
+        whitelist: Object.keys(pool.whitelist).sort(),
+      },
       audit: audit.tail(40),
     };
   }

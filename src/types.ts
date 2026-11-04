@@ -31,6 +31,15 @@ export interface ToolExample {
  */
 export type ToolDeps = Record<string, string>;
 
+/**
+ * 依赖从哪来。
+ *
+ * whitelist = 随包分发的离线白名单，进过一次人工审核，可复现、不联网；
+ * network   = 联网现装，代码来自 registry，没有经过本项目的审核流程。
+ * 这两者必须能区分：出事后第一个问题永远是「这份代码是哪来的」。
+ */
+export type DepSource = 'whitelist' | 'network';
+
 /** 实际装进来的一个包 */
 export interface InstalledDep {
   name: string;
@@ -50,6 +59,8 @@ export interface DepRecord {
   totalBytes: number;
   /** 传递依赖包数，用来兜住「一个包拖进两百个包」的情况 */
   transitiveCount: number;
+  /** 安装来源。老记录里没有这个字段，按 undefined 处理 */
+  source?: DepSource;
 }
 
 /** 各 kind 的实现字段都塞这里，字段按 kind 取用 */
@@ -202,4 +213,18 @@ export interface ToolSummary {
     at: string;
   } | null;
   source: string;
+  /** 三方依赖的可视化数据：声明了什么、装没装、缺哪些 */
+  deps: DepView;
+}
+
+/** 只给界面看的依赖视图，不含任何可执行路径 */
+export interface DepView {
+  /** 声明的直接依赖：包名 → 精确版本 */
+  declared: ToolDeps;
+  /** 真实的安装记录；null 表示没装过（待审、或安装失败） */
+  installed: DepRecord | null;
+  /** 没被白名单覆盖的包名。非空即为「联网装过」或「压根没装」 */
+  missing: string[];
+  /** 本机白名单根目录；null 表示当前形态下没有白名单（比如开发态还没构建） */
+  whitelistRoot: string | null;
 }

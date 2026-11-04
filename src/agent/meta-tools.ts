@@ -7,8 +7,7 @@ import * as audit from '../core/audit.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { dirs, toolDir } from '../core/paths.js';
-import { installToolDeps, planSharedDeps, toDepRecord, type DepInstallReport } from '../core/deps.js';
-import { sharedDepsRoot } from '../core/appPaths.js';
+import { installToolDeps, planSharedDeps, readDepPolicy, toDepRecord, type DepInstallReport } from '../core/deps.js';
 import type { Json, JsonSchema, Tool, ToolImpl, ToolResult, Permissions } from '../types.js';
 
 // 元工具：Agent 用来「看仓库、找工具、造工具」的那几件。
@@ -342,11 +341,18 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
   //    白名单外的依赖一律不装、不跑，直接转人工。
   const depNames = Object.keys(tool.impl.deps ?? {});
   const depPlan = depNames.length ? planSharedDeps(tool) : null;
-  const depsBlocked = depNames.length > 0 && (!depPlan || depPlan.missing.length > 0);
+  const policy = readDepPolicy();
+  const depOutOfWhitelist = depNames.length > 0 && (!depPlan || depPlan.missing.length > 0);
+  // 白名单外 + 用户没开联网开关 = 不装、不跑用例、直接转人工。
+  // 开了开关则继续往下走（安装 → 跑用例 → 定级仍是 L3），让用户在放行前能看到真实用例结果。
+  const depsBlocked = depOutOfWhitelist && !policy.allowUnvettedDeps;
   if (depsBlocked) {
     const missing = depPlan ? depPlan.missing : depNames;
     const reasons = [`依赖 ${missing.length} 个白名单外的三方包（${missing.join(', ')}）：未安装、未跑用例，等人工决定`];
     if (!depPlan) reasons.push('本机没有离线白名单目录，离线安装这条路在当前形态下不可用');
+    if (depNames.length) {
+      reasons.push('联网安装开关未开启（settings.json 的 allowUnvettedDeps，或环境变量 TOOLFORGE_ALLOW_NET_DEPS=1）');
+    }
     store.patch(tool.id, {
       status: 'pending',
       trust: 'L3',
@@ -361,14 +367,22 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
       needsHuman: true,
       findings: findings.length,
     });
+    // 依赖被拦下是独立事件，不是「审核」的子集：事后要能单独统计「多少次是因为依赖被挡」
+    audit.append({
+      type: 'deps_blocked',
+      tool: tool.name,
+      declared: tool.impl.deps,
+      missing,
+      whitelistRoot: policy.sharedDepsRoot,
+    });
     return JSON.stringify({
       ok: false,
       stage: 'deps',
       tool: { id: tool.id, name: tool.name, kind: tool.kind, trust: 'L3', status: 'pending' },
-      deps: { declared: tool.impl.deps, missing, sharedDepsRoot: sharedDepsRoot() },
+      deps: { declared: tool.impl.deps, missing, sharedDepsRoot: policy.sharedDepsRoot, allowUnvettedDeps: policy.allowUnvettedDeps },
       review: { level: 'L3', needsHuman: true, reasons, findings },
       hint:
-        '这些依赖不在本机离线白名单里，所以既没安装也没跑用例。可选：把包加进 shared-deps.json 后重新打包；换一个不依赖它们的实现；或由用户人工放行后再联网安装。',
+        '这些依赖不在本机离线白名单里，所以既没安装也没跑用例。可选：① 换成不依赖它们的实现；② 请用户在设置页开启「允许联网安装白名单外的依赖」，再重新调一次 create_tool（装完会跑用例，但级别仍是 L3，需人工放行）；③ 把包按白名单四条标准审过后加进 shared-deps.json 并重新构建。',
     });
   }
 
@@ -378,6 +392,17 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
     try {
       depReport = await installToolDeps(tool);
       store.patch(tool.id, { meta: { deps: toDepRecord(depReport) } });
+      // 依赖事件独立落审计：白名单复制与联网安装在事后追责时是完全不同的两件事
+      audit.append({
+        type: 'deps_install',
+        tool: tool.name,
+        source: depReport.source,
+        manager: depReport.manager,
+        packages: depReport.installed.map((d) => d.name + '@' + d.version),
+        totalBytes: depReport.totalBytes,
+        transitiveCount: depReport.transitiveCount,
+        ms: depReport.ms,
+      });
     } catch (err) {
       const message = (err as Error).message;
       store.patch(tool.id, { status: 'pending' });
@@ -442,6 +467,7 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
       manager: depReport.manager,
       skipped: depReport.skipped,
       ms: depReport.ms,
+      source: depReport.source,
       packages: depReport.installed,
       totalBytes: depReport.totalBytes,
       transitiveCount: depReport.transitiveCount,

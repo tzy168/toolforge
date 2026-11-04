@@ -23,7 +23,11 @@
     "verify:deps": "node scripts/verify-deps.mjs",
     "pack:desktop": "pnpm build && node scripts/build-desktop.mjs",
     "verify:pack": "node scripts/verify-pack.mjs",
-    "verify:gate": "node scripts/verify-gate.mjs"
+    "verify:gate": "node scripts/verify-gate.mjs",
+    "shared:deps": "node scripts/build-shared-deps.mjs",
+    "verify:whitelist": "node scripts/verify-whitelist.mjs",
+    "curate:deps": "node scripts/curate-shared-deps.mjs",
+    "installer": "node scripts/build-installer.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1",

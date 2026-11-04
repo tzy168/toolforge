@@ -83,6 +83,21 @@ async function installInto(dependencies, tag) {
   return cached;
 }
 
+/** vendor 里的实际版本是否与清单逐一对得上 */
+function vendorMatches(vendorModules, pkgs) {
+  for (const [name, version] of Object.entries(pkgs)) {
+    const file = path.join(vendorModules, name, 'package.json');
+    if (!fs.existsSync(file)) return false;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+      if (String(pkg.version) !== version) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function countTree(dir) {
   let bytes = 0;
   let files = 0;
@@ -188,7 +203,18 @@ async function main() {
     const names = Object.keys(pkgs);
     if (names.length) {
       log(`准备离线白名单（${names.length} 个：${names.join(', ')}）`);
-      const sharedModules = await installInto(pkgs, 'shared');
+      // 优先复用 vendor/shared-deps：那份由 build-shared-deps.mjs 产出，并且已经过
+      // verify-whitelist 的双运行时 require 验收。打包时现场再装一遍，等于换一棵树，
+      // 验收结论就不成立了。清单对不上才回落到现场安装。
+      const vendorModules = path.join(ROOT, 'vendor', 'shared-deps', 'node_modules');
+      let sharedModules;
+      if (fs.existsSync(vendorModules) && vendorMatches(vendorModules, pkgs)) {
+        log('复用 vendor/shared-deps（已验收）');
+        sharedModules = vendorModules;
+      } else {
+        log('vendor/shared-deps 缺失或与清单不一致，现场安装');
+        sharedModules = await installInto(pkgs, 'shared');
+      }
       copyDir(sharedModules, path.join(OUT, 'resources', 'shared-deps', 'node_modules'));
       fs.writeFileSync(path.join(OUT, 'resources', 'shared-deps', 'shared-deps.json'), JSON.stringify(wl, null, 2), 'utf8');
     }

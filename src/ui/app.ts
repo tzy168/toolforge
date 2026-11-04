@@ -23,6 +23,20 @@ interface ToolSummary {
     at: string;
   } | null;
   source: string;
+  /** 三方依赖：声明了什么、装没装、白名单缺哪些 */
+  deps?: {
+    declared: Record<string, string>;
+    installed: {
+      manager: string;
+      source?: string;
+      packages: Array<{ name: string; version: string }>;
+      totalBytes: number;
+      transitiveCount: number;
+      at: string;
+    } | null;
+    missing: string[];
+    whitelistRoot: string | null;
+  };
 }
 
 interface ProviderView {
@@ -46,6 +60,7 @@ interface ForgeState {
   broken: Array<{ id: string; error: string }>;
   mcp: { available: boolean; status: Record<string, string>; count: number };
   sandbox: { probed: boolean; flag: string | null };
+  depPolicy: { allowUnvettedDeps: boolean; origin: string; sharedDepsRoot: string | null; whitelist: string[] };
 }
 
 type Envelope<T> = { ok: true; data: T } | { ok: false; error: string };
@@ -79,6 +94,8 @@ interface Bridge {
   reject: (id: string) => Promise<Envelope<unknown>>;
   remove: (id: string) => Promise<Envelope<unknown>>;
   setEnabled: (id: string, enabled: boolean) => Promise<Envelope<unknown>>;
+  /** 开关「联网安装白名单外依赖」。这是用户授权动作，必须由人点 */
+  setAllowUnvettedDeps: (on: boolean) => Promise<Envelope<unknown>>;
   saveProvider: (p: Partial<ProviderView> & { apiKey?: string }) => Promise<Envelope<unknown>>;
   removeProvider: (id: string) => Promise<Envelope<unknown>>;
   setActiveProvider: (id: string | null) => Promise<Envelope<unknown>>;
@@ -981,6 +998,7 @@ async function refresh(): Promise<void> {
 
   renderModels(s.models);
   renderRuntime(s);
+  renderDepPolicy(s);
 
   const pendingList = $<HTMLDivElement>('#pendingList');
   pendingList.innerHTML = '';
@@ -1005,6 +1023,30 @@ async function refresh(): Promise<void> {
   lastTools = s.tools.filter((x) => x.status !== 'pending' && x.status !== 'rejected');
   renderToolFilter();
   renderToolList();
+}
+
+/**
+ * 依赖策略一栏。
+ *
+ * 展示的三件事都得是真的：开关现在是什么状态、这个状态是谁给的（人点的还是环境变量），
+ * 以及白名单里到底有什么。少了哪一项，用户看到「白名单外」就不知道该改哪儿。
+ */
+function renderDepPolicy(s: ForgeState): void {
+  const box = $<HTMLInputElement>('#depNetToggle');
+  const line = $<HTMLParagraphElement>('#depWhitelistLine');
+  const why = $<HTMLParagraphElement>('#depPolicyLine');
+  if (!box || !line || !why) return;
+  box.checked = s.depPolicy.allowUnvettedDeps;
+  const names = s.depPolicy.whitelist;
+  line.textContent = names.length
+    ? `离线白名单 ${names.length} 个包：${names.join(', ')}`
+    : s.depPolicy.sharedDepsRoot
+      ? '离线白名单是空的。'
+      : '本机没有离线白名单目录（开发态未构建，或安装包缺少 shared-deps）——此时只有联网一条路。';
+  why.textContent = s.depPolicy.allowUnvettedDeps
+    ? `联网安装：已开启（来源 ${s.depPolicy.origin}）。白名单外的依赖会联网下载并执行，工具级别仍是 L3，需人工放行。`
+    : '联网安装：已关闭。白名单外的依赖一律不装、不跑用例，直接落为待放行。';
+  why.classList.toggle('warn', s.depPolicy.allowUnvettedDeps);
 }
 
 /** 运行环境一行：沙箱到底有没有 OS 级隔离，不能靠默认值猜 */
@@ -1139,7 +1181,10 @@ if (toolSearchBox) {
 
 function toolRow(t: ToolSummary): HTMLElement {
   const row = el('div', 'tool');
-  row.title = `${t.description}\n权限：${t.permissions}\n版本：${t.version}`;
+  const depNames = Object.keys(t.deps?.declared || {});
+  row.title =
+    `${t.description}\n权限：${t.permissions}\n版本：${t.version}` +
+    (depNames.length ? `\n依赖：${depNames.map((n) => `${n}@${t.deps?.declared[n]}`).join(', ')}` : '');
 
   const dot = el('div', `dot ${t.status}`);
   const body = el('div', 'tool-body');
@@ -1212,6 +1257,51 @@ function enableSwitch(t: ToolSummary): HTMLElement {
   return wrap;
 }
 
+/**
+ * 依赖明细块。放行前用户要看的就三件：装了什么、多大、有没有出白名单。
+ *
+ * missing 非空必须单独用红字——那是「这件工具还没真正跑起来」的根因；
+ * 只显示声明列表会让人以为它已经能用了。
+ */
+function depsDetail(t: ToolSummary): HTMLElement | null {
+  const d = t.deps;
+  if (!d || !Object.keys(d.declared).length) return null;
+  const box = el('details', 'pending-detail dep-box');
+  const names = Object.keys(d.declared);
+  const sum = el('summary');
+  const state = d.missing.length ? '未装齐' : d.installed ? '已装' : '未安装';
+  sum.textContent = `三方依赖 ${names.length} 个 · ${state}`;
+  box.appendChild(sum);
+
+  for (const name of names) {
+    const line = el('div', 'pending-test');
+    const missing = d.missing.includes(name);
+    line.textContent = (missing ? '! ' : '· ') + `${name}@${d.declared[name]}` + (missing ? '（不在离线白名单）' : '');
+    if (missing) line.classList.add('fail');
+    box.appendChild(line);
+  }
+
+  if (d.installed) {
+    const i = d.installed;
+    const info = el('div', 'pending-test');
+    const mb = (i.totalBytes / 1024 / 1024).toFixed(2);
+    const src = i.source === 'network' ? '联网安装' : i.source === 'whitelist' ? '离线白名单复制' : '来源未知';
+    info.textContent = `实际占用 ${mb}MB / 传递依赖 ${i.transitiveCount} 个 · ${src}（${i.manager}）`;
+    box.appendChild(info);
+  } else {
+    const tip = el('div', 'pending-test');
+    tip.textContent = '依赖尚未安装，自带用例也就还没跑过。';
+    box.appendChild(tip);
+  }
+
+  if (d.missing.length && !d.whitelistRoot) {
+    const tip = el('div', 'pending-test');
+    tip.textContent = '本机没有离线白名单目录，所以这些包无处可装。';
+    box.appendChild(tip);
+  }
+  return box;
+}
+
 function pendingCard(t: ToolSummary): HTMLElement {
   const card = el('div', 'pending-card');
   const head = el('div', 'pending-head');
@@ -1227,6 +1317,8 @@ function pendingCard(t: ToolSummary): HTMLElement {
   const perm = el('div', 'pending-perm');
   perm.textContent = t.permissions;
   card.append(head, perm);
+  const deps = depsDetail(t);
+  if (deps) card.appendChild(deps);
   for (const hit of hits) {
     const warn = el('div', 'pending-warn');
     warn.textContent = hit;
@@ -1795,6 +1887,34 @@ function newTaskIn(ws: TaskWorkspace): void {
 }
 
 $<HTMLButtonElement>('#newTaskBtn').addEventListener('click', () => newTaskIn(null));
+
+/**
+ * 联网装依赖开关。
+ *
+ * 开：必须二次确认——勾上之后 agent 造的工具声明的依赖会立刻联网下载，并在跑用例时执行。
+ * 关：直接生效，不再问一次。收紧权限不该有摩擦。
+ */
+const depNetToggle = $<HTMLInputElement>('#depNetToggle');
+depNetToggle.addEventListener('change', async () => {
+  const want = depNetToggle.checked;
+  if (want) {
+    const confirmed = confirm(
+      '开启后，新建的工具可以联网安装离线白名单之外的依赖。\n\n' +
+        '那些代码来自 registry，没有经过本项目审核；安装完成后会立刻跑自带用例，也就是会执行它们。\n\n' +
+        '工具级别仍会是 L3，需要你逐个放行。确定开启？'
+    );
+    if (!confirmed) {
+      depNetToggle.checked = false;
+      return;
+    }
+  }
+  const res = await window.tf?.setAllowUnvettedDeps(want);
+  if (res && !res.ok) {
+    alert(res.error);
+    depNetToggle.checked = !want;
+  }
+  refresh();
+});
 
 $<HTMLButtonElement>('#importBtn').addEventListener('click', async () => {
   const res = await window.tf?.importPack();
