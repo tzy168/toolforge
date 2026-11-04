@@ -105,10 +105,37 @@ chat.appendChild(inner);
 
 let phase: 'work' | 'create' = 'work';
 let busy = false;
-let currentTurn: HTMLElement | null = null;
-let lastTraceItem: { item: HTMLElement; detail: HTMLElement; state: HTMLElement } | null = null;
-// 流式回答的累积文本，每轮开始清空
-let streamBuffer = '';
+
+/**
+ * 正在执行的那一轮。
+ *
+ * 以前这里存的是 DOM 节点，切任务时 `renderHistory` 会把对话区整个清空，
+ * 节点就成了孤儿：事件继续往里写，用户却永远看不到，切回来上下文也空了。
+ * 所以改成存数据，切回该任务时按它重建界面。
+ * 同一时刻只允许一轮（后端事件不带任务 id，并发会串台），靠 `busy` 保证。
+ */
+interface LiveTrace {
+  name: string;
+  args: string;
+  /** undefined 表示还在跑 */
+  ok?: boolean;
+  ms?: number;
+  t0: number;
+}
+
+interface LiveRun {
+  taskId: string;
+  /** 这一轮用户说的话。history 要等结束才 push，所以重建时得单独记一份 */
+  pendingInput: string;
+  /** 等待态文案，随 step 更新 */
+  thinking: string;
+  /** 累积的流式正文 */
+  reply: string;
+  started: number;
+  traces: LiveTrace[];
+}
+
+let liveRun: LiveRun | null = null;
 // 流式片段按帧合并：每片都重新解析 Markdown 是 O(n²)，一屏的量级也够卡
 let renderQueued = false;
 /**
@@ -308,8 +335,8 @@ function setPhase(next: 'work' | 'create'): void {
   document.querySelectorAll('.tab').forEach((t) => {
     t.classList.toggle('active', (t as HTMLElement).dataset.phase === phase);
   });
-  $<HTMLTextAreaElement>('#input').placeholder =
-    phase === 'create' ? '描述你要造的工具，例如：抓取某个页面的标题' : '说说你要做什么…（Shift + Enter 换行）';
+  // 占位文案由 setBusy 统一管（它同时要知道忙不忙），别再各写一份
+  syncComposer();
   const task = currentTask();
   if (task) task.phase = phase;
   saveTasks();
@@ -441,22 +468,68 @@ function botTurn(content = ''): HTMLElement {
   return turn;
 }
 
-// 切换任务时从 history 重建对话；工具调用轨迹不落盘，重建后只留问答
-// ponytail: 轨迹只在当前会话可见，要留存得在 Task 里一起存 turns
+/**
+ * 按任务重建对话区。
+ *
+ * 工具调用轨迹不落盘（`ponytail:` 要留存得在 Task 里一起存 traces），
+ * 但**正在执行的那一轮必须能重建**——否则切走再切回来，用户会看到自己的问题没了、
+ * 界面卡在空白，而后台还在跑。所以 liveRun 里的用户消息、轨迹、半截正文都要画出来。
+ */
 function renderHistory(task: Task | null): void {
   inner.innerHTML = '';
   const history = task?.history ?? [];
-  if (!history.length) {
+  const live = task && liveRun && liveRun.taskId === task.id ? liveRun : null;
+
+  if (!history.length && !live) {
     inner.appendChild(emptyState());
     return;
   }
+
   for (let i = 0; i < history.length; i += 2) {
     const user = history[i];
     const bot = history[i + 1];
     if (user) inner.appendChild(userTurn(user.content));
     if (bot) inner.appendChild(botTurn(bot.content || '（没有输出）'));
   }
+
+  if (live) {
+    // 这一轮的提问还没落进 history（要等结束才 push），所以在这里补画
+    inner.appendChild(userTurn(live.pendingInput ?? ''));
+    inner.appendChild(buildLiveTurn(live));
+    // 切回来时秒表要接着走（ticker 是全局的，通常还在转；这里兜一手）
+    startTicker();
+  }
   scrollBottom();
+}
+
+/** 按 liveRun 的数据把「正在跑的这一轮」搭出来：轨迹徽章 + 等待态或半截正文 */
+function buildLiveTurn(live: LiveRun): HTMLElement {
+  const turn = el('div', 'turn turn-bot live-turn');
+  const trace = el('div', 'trace');
+  for (const t of live.traces) {
+    const chip = el('div', `call-chip${t.ok === undefined ? ' running' : t.ok ? ' done' : ' fail'}`);
+    chip.dataset.t0 = String(t.t0);
+    const nm = el('span', 't-name');
+    nm.textContent = t.name;
+    const args = el('span', 't-args');
+    args.textContent = t.args;
+    const state = el('span', 't-state');
+    state.textContent =
+      t.ok === undefined ? fmtElapsed(Date.now() - t.t0) : t.ok ? `✓ ${t.ms || 0}ms` : '✗ 失败';
+    chip.append(nm, args, state);
+    trace.appendChild(chip);
+  }
+
+  const bubble = el('div', 'msg-bot md');
+  if (live.reply) {
+    bubble.classList.add('streaming');
+    bubble.innerHTML = markdownToHtml(live.reply);
+  } else {
+    bubble.classList.add('typing');
+    bubble.appendChild(thinkingBlock(live.thinking));
+  }
+  turn.append(trace, bubble);
+  return turn;
 }
 
 function openTask(id: string | null): void {
@@ -881,10 +954,26 @@ $<HTMLButtonElement>('#mpAdd').addEventListener('click', async () => {
 
 /* ---------------- 发送 ---------------- */
 
+/**
+ * 同步输入区的状态：按钮可用性 + 占位文案。
+ *
+ * 输入框**永远不禁用**——切到别的任务时用户应该能接着说别的事，
+ * 禁用还会让人以为程序卡死了。真正挡住重复提交的是 `busy` 这个标志。
+ */
 function setBusy(v: boolean): void {
   busy = v;
-  $<HTMLButtonElement>('#sendBtn').disabled = v;
-  $<HTMLTextAreaElement>('#input').disabled = v;
+  syncComposer();
+}
+
+function syncComposer(): void {
+  const btn = $<HTMLButtonElement>('#sendBtn');
+  btn.disabled = busy;
+  btn.title = busy ? '上一轮还在跑，等它结束' : '';
+  $<HTMLTextAreaElement>('#input').placeholder = busy
+    ? '上一轮还在跑…可以先切到别的任务'
+    : phase === 'create'
+      ? '描述你要造的工具，例如：抓取某个页面的标题'
+      : '说说你要做什么…（Shift + Enter 换行）';
 }
 
 function shorten(s: string, n: number): string {
@@ -900,15 +989,14 @@ function fmtElapsed(ms: number): string {
  * 不给每个元素各开一个定时器：轮次结束忘清一个就是内存泄漏。
  */
 let ticker: number | null = null;
-let turnStarted = 0;
 
 function startTicker(): void {
   if (ticker !== null) return;
-  turnStarted = Date.now();
   ticker = window.setInterval(() => {
     const now = Date.now();
-    const clock = currentTurn?.querySelector<HTMLElement>('.thinking-clock');
-    if (clock) clock.textContent = fmtElapsed(now - turnStarted);
+    // 秒表跟着 liveRun 的起点走，切任务重建后读数依然连续
+    const clock = inner.querySelector<HTMLElement>('.thinking-clock');
+    if (clock && liveRun) clock.textContent = fmtElapsed(now - liveRun.started);
     for (const chip of document.querySelectorAll<HTMLElement>('.call-chip.running')) {
       const state = chip.querySelector<HTMLElement>('.t-state');
       if (state) state.textContent = fmtElapsed(now - Number(chip.dataset.t0 || now));
@@ -945,41 +1033,12 @@ function thinkingBlock(text: string): HTMLElement {
 
 /** 换一句等待文案。重放一次模糊收束，让「第 2 步」这种变化看得出来 */
 function setThinkingLabel(text: string): void {
-  const label = currentTurn?.querySelector<HTMLElement>('.thinking-label');
+  const label = inner.querySelector<HTMLElement>('.thinking-label');
   if (!label) return;
   label.textContent = text;
   label.classList.remove('blur-in');
   void label.offsetWidth; // 强制回流，动画才会重播
   label.classList.add('blur-in');
-}
-
-/** 工具轨迹徽章：填充扫过 + 实时计时，结束转绿或抖动变红。移植自 ReactBits Call Chip */
-function addTrace(event: EventPayload): void {
-  if (!currentTurn) return;
-  const trace = currentTurn.querySelector('.trace');
-  if (!trace) return;
-
-  if (event.type === 'tool_call') {
-    const chip = el('div', 'call-chip running');
-    chip.dataset.t0 = String(Date.now());
-    const nm = el('span', 't-name');
-    nm.textContent = event.name || '';
-    const args = el('span', 't-args');
-    args.textContent = shorten(JSON.stringify(event.args || {}), 90);
-    const state = el('span', 't-state');
-    state.textContent = '0ms';
-    chip.append(nm, args, state);
-    trace.appendChild(chip);
-    lastTraceItem = { item: chip, detail: args, state };
-  } else if (lastTraceItem) {
-    const ok = Boolean(event.ok);
-    lastTraceItem.item.classList.remove('running');
-    lastTraceItem.item.classList.add(ok ? 'done' : 'fail');
-    // 成功用真实耗时落定，失败不必报时长，用户只关心没成
-    lastTraceItem.state.textContent = ok ? `✓ ${event.ms || 0}ms` : '✗ 失败';
-    lastTraceItem = null;
-  }
-  scrollBottom();
 }
 
 /** 出错态：给气泡加个红色左边框，别让错误混在正常回答里 */
@@ -1008,17 +1067,20 @@ async function send(text: string): Promise<void> {
   inner.appendChild(userTurn(text));
 
   // 一条 AI 回复里可能有多轮工具调用，trace 记在气泡上方
-  currentTurn = el('div', 'turn turn-bot');
+  const turn = el('div', 'turn turn-bot');
   const trace = el('div', 'trace');
   const bubble = el('div', 'msg-bot md typing');
   bubble.appendChild(thinkingBlock('思考中…'));
-  currentTurn.append(trace, bubble);
-  inner.appendChild(currentTurn);
+  turn.append(trace, bubble);
+  inner.appendChild(turn);
   startTicker();
   scrollBottom();
 
-  const turn = currentTurn;
+  // 记成数据而不是抓着 DOM：用户随时可能切走，切回来要能照原样重建
+  liveRun = { taskId: task.id, pendingInput: text, thinking: '思考中…', reply: '', started: Date.now(), traces: [] };
+
   let streamed = '';
+  let failed = '';
   try {
     const res = await window.tf.chat({
       input: text,
@@ -1027,26 +1089,35 @@ async function send(text: string): Promise<void> {
       // 'general' 与 null 对后端都意味着「不绑定目录」，具体路径才传下去
       workspace: typeof task.workspace === 'string' ? task.workspace : null,
     });
-    bubble.classList.remove('typing', 'streaming');
     if (res.ok) {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
       streamed = res.data.reply || '';
-      bubble.innerHTML = streamed ? markdownToHtml(streamed) : '（没有输出）';
-      task.history.push({ role: 'user', content: text }, { role: 'assistant', content: streamed });
-      task.history = task.history.slice(-8);
     } else {
-      showError(bubble, '出错了：' + res.error);
+      failed = res.error;
     }
   } catch (err) {
-    showError(bubble, '出错了：' + (err as Error).message);
+    failed = (err as Error).message;
   }
 
+  // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失
+  task.history.push({ role: 'user', content: text }, { role: 'assistant', content: streamed });
+  task.history = task.history.slice(-8);
+
   stopTicker();
-  currentTurn = null;
-  lastTraceItem = null;
+  liveRun = null;
   setBusy(false);
-  scrollBottom();
   saveTasks();
+
+  // 用户若已切走，就别把人拽回来；等他切回来时 renderHistory 会画出完整记录
+  if (activeId === task.id) {
+    renderHistory(task);
+    if (failed) {
+      const last = inner.querySelector<HTMLElement>('.turn-bot:last-child .msg-bot');
+      if (last) showError(last, '出错了：' + failed);
+    } else {
+      scrollBottom();
+    }
+  }
   refresh();
 }
 
@@ -1242,33 +1313,65 @@ document.addEventListener('keydown', (e) => {
 
 if (window.tf) {
   window.tf.onEvent((event) => {
-    if (event.type === 'tool_call' || event.type === 'tool_result') addTrace(event);
-    if (event.type === 'step' && currentTurn) {
+    if (!liveRun) return;
+    // 用户可能已经切到别的任务；此时数据照收，但界面不碰
+    const onScreen = activeId === liveRun.taskId;
+
+    if (event.type === 'tool_call') {
+      liveRun.traces.push({
+        name: event.name || '',
+        args: shorten(JSON.stringify(event.args || {}), 90),
+        t0: Date.now(),
+      });
+      if (onScreen) paintTrace();
+    } else if (event.type === 'tool_result') {
+      // 落定最后一条还在跑的工具
+      const last = [...liveRun.traces].reverse().find((t) => t.ok === undefined);
+      if (last) {
+        last.ok = Boolean(event.ok);
+        last.ms = event.ms;
+      }
+      if (onScreen) paintTrace();
+    } else if (event.type === 'step') {
       // 每一步开始时清空累积文本：前一步的内容多半是「我先查一下」，最终答案在最后一步
-      streamBuffer = '';
-      setThinkingLabel(`思考中…（第 ${event.step} 步，${event.toolCount} 件工具在场）`);
+      liveRun.reply = '';
+      liveRun.thinking = `思考中…（第 ${event.step} 步，${event.toolCount} 件工具在场）`;
+      if (onScreen) setThinkingLabel(liveRun.thinking);
+    } else if (event.type === 'delta' && event.delta) {
+      liveRun.reply += event.delta;
+      if (!onScreen) return;
+      queueReplyPaint();
     }
-    // 流式增量：先拼到本地字符串，再按帧整段重渲染 MD（每片都解析会 O(n²)）
-    if (event.type === 'delta' && currentTurn && event.delta) {
-      streamBuffer += event.delta;
-      const turn = currentTurn;
-      const bubble = turn.querySelector<HTMLElement>('.msg-bot');
-      if (!bubble) return;
+  });
+}
+
+/** 把 liveRun 的轨迹画到当前这一轮上（只在该任务可见时调用） */
+function paintTrace(): void {
+  const turn = inner.querySelector<HTMLElement>('.live-turn');
+  if (!turn || !liveRun) return;
+  const fresh = buildLiveTurn(liveRun).querySelector('.trace');
+  const old = turn.querySelector('.trace');
+  if (fresh && old) turn.replaceChild(fresh, old);
+  scrollBottom();
+}
+
+/** 流式正文按帧合并重画（每片都解析 Markdown 是 O(n²)） */
+function queueReplyPaint(): void {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const turn = inner.querySelector<HTMLElement>('.live-turn');
+    if (!turn || !liveRun) return;
+    const bubble = turn.querySelector<HTMLElement>('.msg-bot');
+    if (!bubble) return;
+    if (bubble.classList.contains('typing')) {
       // 首个增量到达就把等待块换成真内容，并挂上打字光标
-      if (bubble.classList.contains('typing')) {
-        bubble.classList.remove('typing');
-        bubble.classList.add('streaming');
-        bubble.innerHTML = '';
-      }
-      if (!renderQueued) {
-        renderQueued = true;
-        requestAnimationFrame(() => {
-          renderQueued = false;
-          bubble.innerHTML = markdownToHtml(streamBuffer);
-          scrollBottom();
-        });
-      }
+      bubble.classList.remove('typing');
+      bubble.classList.add('streaming');
     }
+    bubble.innerHTML = markdownToHtml(liveRun.reply);
+    scrollBottom();
   });
 }
 

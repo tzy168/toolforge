@@ -107,6 +107,7 @@ untested ──用例通过、低危──> active
 - 只改 UI 时也要跑一次 `pnpm build`，`src/ui/build/app.js` 是产物且被 gitignore，`index.html` 直接引它。
 - 测试一律把 `TOOLFORGE_HOME` 指到临时目录，别污染真实的 `~/.toolforge`。
 - 非平凡逻辑要留一条能失败的检查：`test/loop.test.ts` 里新增断言后，用变异验证一次（把被测逻辑改坏，确认断言真的红），再改回来。
+- 改动渲染层的任务切换 / 流式渲染时，跑 `pnpm verify:switch`：它起一个只收不回应的桩服务，制造「AI 还在跑」的窗口，然后自动走一遍发送 → 切走 → 切回，断言上下文还在、在飞的那轮被重建、输入框没被禁用。
 
 ## 常见坑
 
@@ -119,5 +120,9 @@ untested ──用例通过、低危──> active
 - **流式渲染要按帧合并**：`delta` 事件可能几十毫秒来一片，每片都 `markdownToHtml` 重解析是 O(n²)，`app.ts` 用 `requestAnimationFrame` 节流。别把这一层去掉。
 - **别在流式输出时强制 `scrollTop` 到底**：用户往上翻着读时硬拽回底部等于不让人看，`scrollBottom()` 只在贴底时才滚。
 - **等待态的心跳只有一个**：`startTicker()` / `stopTicker()` 全局共用一个 100ms 定时器，同时刷新等待秒表和所有 `.call-chip.running` 的耗时。别给每个元素各开一个 `setInterval`——轮次结束忘清一个就是泄漏。
+- **在飞的那一轮存数据，不存 DOM**：`liveRun`（`LiveRun`）记着 taskId、pendingInput、thinking、reply、traces。**别把它改回持有 DOM 节点**——`renderHistory()` 会 `inner.innerHTML = ''`，节点立刻成孤儿，事件继续往里写但用户看不到，切回该任务时上下文全空。用户随时可能切走，`renderHistory` 必须靠 liveRun 把这一轮重建出来。
+- **事件可能来自别的任务**：`onEvent` 里先判断 `activeId === liveRun.taskId`，是才碰 DOM，否则只更新数据。别无条件往界面上写。
+- **输入框永远别禁用**：`syncComposer()` 只控发送按钮和占位文案。禁用 textarea 会让用户以为程序卡死，而且切到别的任务时他本该能接着说别的事。挡重复提交靠 `busy` 标志。
+- **history 必须无条件落盘**：`send()` 无论成功失败都把 {user, assistant} push 进 `task.history`，否则切走再回来，用户的问题凭空消失。
 - **界面动效全部用纯 CSS 写**：视觉参考 ReactBits，但不引 React、不引 GSAP（界面无打包器 + CSP 禁 CDN）。新增动效必须同时进 `prefers-reduced-motion` 的白名单，且优先动画 `transform` / `opacity` / `background`，别动会触发重排的属性。
 - **截图验证**：`TF_SMOKE=1` 会加载完即退出并打印桥接状态；再加 `TF_SHOT=<png 路径>` 落一张截图，`TF_SMOKE_JS="<js>"` 可在截图前跑一段界面操作（例如点开设置页），用来验证非默认页面。脚本里若要写中文，**写成 ASCII 或直接内联到命令行**：PowerShell 5.1 的 `Get-Content` 会按 ANSI 解码 UTF-8 文件，中文会把脚本读成乱码。

@@ -12,7 +12,8 @@
     "start": "pnpm build && node dist/bin/start.cjs",
     "cli": "pnpm build && node dist/bin/cli.js",
     "test": "pnpm build && node --test dist/test/loop.test.js",
-    "selftest": "pnpm build && node dist/bin/cli.js --selftest"
+    "selftest": "pnpm build && node dist/bin/cli.js --selftest",
+    "verify:switch": "pnpm build && node scripts/verify-switch.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1",
