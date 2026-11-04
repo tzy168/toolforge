@@ -1611,24 +1611,17 @@ function stopTicker(): void {
   ticker = null;
 }
 
-/** 等待态：点阵 + 文案 + 秒表。视觉效果移植自 ReactBits 的 Lattice Loader */
+/** 等待态：驶过的卡车 + 文案 + 秒表。标记只给读屏，画面本身不参与朗读 */
 function thinkingBlock(text: string): HTMLElement {
   const box = el('div', 'thinking');
-  const grid = el('div', 'lattice');
-  grid.setAttribute('aria-hidden', 'true');
-  // 3×5 个格子，按 r+c 定相位，亮带沿对角线扫过去
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 5; c++) {
-      const cell = el('i');
-      cell.style.setProperty('--d', String(r + c));
-      grid.appendChild(cell);
-    }
-  }
+  // 模板在 index.html 里，克隆一份就能用；别把整段 SVG 写进这里
+  const frag = $<HTMLTemplateElement>('#truckLoader').content.cloneNode(true) as DocumentFragment;
+  frag.querySelector('.loader')?.setAttribute('aria-hidden', 'true');
   const label = el('span', 'thinking-label');
   label.textContent = text;
   const clock = el('span', 'thinking-clock');
   clock.textContent = '0ms';
-  box.append(grid, label, clock);
+  box.append(frag, label, clock);
   return box;
 }
 

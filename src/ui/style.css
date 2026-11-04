@@ -1273,35 +1273,111 @@ body {
 /* 组内的徽章贴着排，别再各自留一大截外边距 */
 .trace-group-body .call-chip { margin: 3px 0; }
 
-/* ---------- 等待态（移植自 ReactBits Lattice Loader）---------- */
-/* 点阵按对角波次亮起，旁边是走动的秒表——看得出「在干活」而不是卡住了 */
+/* ---------- 等待态：卡车驶过（Uiverse / vinodjangid07）---------- */
+/* 原动画按 200×100 的盒子和 -350px 的行程写的。整场景一起缩放，路灯和虚线才不会
+   跑出缩小后的窗口；0.16 比旁边那行状态文字再矮一截，只占行高的大约三分之二。 */
 .thinking {
+  --truck-s: 0.16;
   display: inline-flex;
   align-items: center;
-  gap: 11px;
-  padding: 9px 2px;
+  gap: 12px;
+  padding: 4px 2px;
   font-size: var(--fs-md);
   color: var(--muted);
 }
-.lattice {
-  display: grid;
-  grid-template-columns: repeat(5, 5px);
-  grid-template-rows: repeat(3, 5px);
-  gap: 3.5px;
+.thinking .loader {
+  width: calc(200px * var(--truck-s));
+  height: calc(100px * var(--truck-s));
   flex: 0 0 auto;
+  overflow: hidden;
 }
-.lattice i {
-  width: 5px;
-  height: 5px;
-  border-radius: 1.5px;
-  background: #dddcd6;
-  animation: lattice-wave 1.5s ease-in-out infinite;
-  animation-delay: calc(var(--d) * 0.11s);
+.thinking .truckWrapper {
+  width: 200px;
+  height: 100px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  align-items: center;
+  justify-content: flex-end;
+  overflow-x: hidden;
+  transform: scale(var(--truck-s));
+  transform-origin: left top;
 }
-/* 亮的那一格走到哪，整格的亮度与轻微放大跟着来，静止截图里也有对比 */
-@keyframes lattice-wave {
-  0%, 62%, 100% { background: #dddcd6; transform: scale(1); }
-  30% { background: var(--ink); transform: scale(1.32); }
+.thinking .truckBody {
+  width: 130px;
+  height: fit-content;
+  margin-bottom: 6px;
+  animation: truck-motion 1s linear infinite;
+}
+/* 页面没有 svg 尺寸复位，不写 width 车身会按默认 300×150 撑破盒子 */
+.thinking .trucksvg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+@keyframes truck-motion {
+  0% { transform: translateY(0); }
+  50% { transform: translateY(3px); }
+  100% { transform: translateY(0); }
+}
+.thinking .truckTires {
+  width: 130px;
+  height: fit-content;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px 0 15px;
+  position: absolute;
+  bottom: 0;
+}
+.thinking .truckTires svg {
+  display: block;
+  width: 24px;
+  height: auto;
+}
+.thinking .road {
+  width: 100%;
+  height: 1.5px;
+  background-color: #282828;
+  position: relative;
+  bottom: 0;
+  align-self: flex-end;
+  border-radius: 3px;
+}
+/* 虚线的缺口用页面底色，不能写死 white，换底色时才会还是「断开的路」 */
+.thinking .road::before {
+  content: "";
+  position: absolute;
+  width: 20px;
+  height: 100%;
+  background-color: #282828;
+  right: -50%;
+  border-radius: 3px;
+  animation: truck-road 1.4s linear infinite;
+  border-left: 10px solid var(--bg);
+}
+.thinking .road::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 100%;
+  background-color: #282828;
+  right: -65%;
+  border-radius: 3px;
+  animation: truck-road 1.4s linear infinite;
+  border-left: 4px solid var(--bg);
+}
+.thinking .lampPost {
+  position: absolute;
+  bottom: 0;
+  right: -90%;
+  height: 90px;
+  width: auto;
+  animation: truck-road 1.4s linear infinite;
+}
+@keyframes truck-road {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-350px); }
 }
 .thinking-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .thinking-clock {
@@ -1355,7 +1431,10 @@ body {
   .call-chip::before,
   .call-chip.running::before,
   .call-chip.fail,
-  .lattice i,
+  .thinking .truckBody,
+  .thinking .road::before,
+  .thinking .road::after,
+  .thinking .lampPost,
   .thinking-label.blur-in,
   .msg-bot.md.streaming::after,
   .hero,
