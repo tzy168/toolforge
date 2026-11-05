@@ -1723,14 +1723,159 @@ function writeAppearance(a: Appearance): void {
 }
 
 /**
+ * 在线款的目标盒子。预览允许放大到看清；对话里只缩小，
+ * 高度卡在一行附近，避免把「思考中」那行撑得很高。
+ */
+const UV_PREVIEW_VIEW = { w: 260, h: 140, cap: false };
+const UV_USE_VIEW = { w: 220, h: 34, cap: true };
+
+/**
+ * 关键帧里的 translate(Npx) 会让字画出布局盒。留出这么多边，静止帧和位移帧都装得下。
+ * ponytail: 不算 skew / 百分比位移。50° 斜切那一帧可能贴边；
+ * 把极端斜切算进盒子，静止时的字会被空边挤小。
+ */
+function uvMotionPad(css: string): number {
+  let n = 10;
+  const re = /translate(?:3d|X|Y)?\(\s*(-?\d+(?:\.\d+)?)px(?:\s*,\s*(-?\d+(?:\.\d+)?)px)?/g;
+  for (const m of css.matchAll(re)) {
+    n = Math.max(n, Math.abs(Number(m[1])) || 0, Math.abs(Number(m[2] || 0)));
+  }
+  return Math.min(n, 36);
+}
+
+/** 盒子等于缩放后的真实尺寸，比例跟内容一致，不另套信箱。 */
+function applyUvFrame(
+  box: HTMLElement,
+  host: HTMLElement,
+  ow: number,
+  oh: number,
+  shiftX: number,
+  shiftY: number,
+  maxW: number,
+  maxH: number,
+  capAtOne: boolean
+): void {
+  let scale = Math.min(maxW / ow, maxH / oh);
+  if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+  if (capAtOne) scale = Math.min(1, scale);
+  host.style.width = `${ow.toFixed(2)}px`;
+  host.style.height = `${oh.toFixed(2)}px`;
+  host.style.transformOrigin = 'top left';
+  host.style.transform = `scale(${scale.toFixed(4)})`;
+  const body = host.shadowRoot?.querySelector(':scope > div');
+  if (body instanceof HTMLElement) {
+    body.style.transformOrigin = 'top left';
+    body.style.transform = shiftX || shiftY ? `translate(${shiftX.toFixed(2)}px, ${shiftY.toFixed(2)}px)` : '';
+  }
+  box.style.width = `${(ow * scale).toFixed(2)}px`;
+  box.style.height = `${(oh * scale).toFixed(2)}px`;
+}
+
+/**
+ * CSS 里的 width/height 经常只是某一个字母或圆点，文字款（Loading…）根本不写宽高。
+ * 挂进文档后按真实排版重算：离屏量出内容外接矩形，再等比放进目标盒子。
+ */
+function queueUvFit(box: HTMLElement, attempt = 0): void {
+  requestAnimationFrame(() => {
+    if (!box.isConnected) {
+      if (attempt < 8) queueUvFit(box, attempt + 1);
+      else box.style.visibility = '';
+      return;
+    }
+    fitUvBox(box);
+  });
+}
+
+function fitUvBox(box: HTMLElement): void {
+  const host = box.querySelector<HTMLElement>(':scope > .uv-host');
+  if (!host?.shadowRoot) {
+    box.style.visibility = '';
+    return;
+  }
+  const maxW = Number(box.dataset.uvMaxW) || UV_USE_VIEW.w;
+  const maxH = Number(box.dataset.uvMaxH) || UV_USE_VIEW.h;
+  const capAtOne = box.dataset.uvCap === '1';
+  const body = host.shadowRoot.querySelector(':scope > div');
+  const holder = document.createElement('div');
+  // 父级 32px 会把 shrink-to-fit 挤窄，量尺寸时挪到不受限的离屏节点
+  holder.style.cssText = 'position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;';
+  document.body.appendChild(holder);
+  try {
+    if (body instanceof HTMLElement) {
+      body.style.transform = 'none';
+      body.style.display = 'inline-block';
+      body.style.width = 'max-content';
+      body.style.height = 'max-content';
+    }
+    host.style.position = 'relative';
+    host.style.left = 'auto';
+    host.style.top = 'auto';
+    host.style.transform = 'none';
+    host.style.display = 'inline-block';
+    host.style.width = 'max-content';
+    host.style.height = 'max-content';
+    holder.appendChild(host);
+
+    const hostRect = host.getBoundingClientRect();
+    let minL = hostRect.left;
+    let minT = hostRect.top;
+    let maxR = hostRect.right;
+    let maxB = hostRect.bottom;
+    host.shadowRoot.querySelectorAll('*').forEach((node) => {
+      const r = node.getBoundingClientRect();
+      if (r.width < 0.5 && r.height < 0.5) return;
+      if (r.width > 1600 || r.height > 1600) return;
+      minL = Math.min(minL, r.left);
+      minT = Math.min(minT, r.top);
+      maxR = Math.max(maxR, r.right);
+      maxB = Math.max(maxB, r.bottom);
+    });
+
+    if (body instanceof HTMLElement) {
+      body.style.display = '';
+      body.style.width = '';
+      body.style.height = '';
+    }
+    host.style.position = '';
+    host.style.left = '';
+    host.style.top = '';
+    host.style.display = '';
+    const css = host.shadowRoot.querySelector('style')?.textContent || '';
+    const pad = uvMotionPad(css);
+    const ow = maxR - minL + pad * 2;
+    const oh = maxB - minT + pad * 2;
+    if (ow < 4 || oh < 4) {
+      applyUvFrame(
+        box,
+        host,
+        Number(box.dataset.uvOw) || 48,
+        Number(box.dataset.uvOh) || 48,
+        0,
+        0,
+        maxW,
+        maxH,
+        capAtOne
+      );
+      return;
+    }
+    applyUvFrame(box, host, ow, oh, hostRect.left - minL + pad, hostRect.top - minT + pad, maxW, maxH, capAtOne);
+    host.dataset.uvFit = '1';
+  } finally {
+    if (host.parentElement !== box) box.appendChild(host);
+    holder.remove();
+    box.style.visibility = '';
+  }
+}
+
+/**
  * 等待态与设置页预览共用一份外层：内置款靠 data-kind、卡车克隆模板、
- * 在线款放进 Shadow DOM（第三方样式天然隔离）。都锁在 32×16 的 .loader 里，
- * 切换不会改动行高。
+ * 在线款放进 Shadow DOM（第三方样式天然隔离）。内置款锁在 32×16；
+ * 在线款按内容真实尺寸等比缩放，预览放大看清，对话里缩小到一行。
  */
 function makeLoader(
   kind: LoaderKind = readAppearance().loader,
   uv?: UvLoaderData,
-  view?: { w: number; h: number }
+  view?: { w: number; h: number; cap: boolean }
 ): HTMLElement {
   if (kind === 'truck') {
     const tpl = $<HTMLTemplateElement>('#truckLoader');
@@ -1744,21 +1889,17 @@ function makeLoader(
   box.dataset.kind = kind;
   box.setAttribute('aria-hidden', 'true');
   if (kind === 'uv' && uv) {
-    // 在线款：按主进程解析到的原生尺寸 ow×oh，等比缩放到「不超过 view 上限」，
-    // 盒子尺寸直接取缩放后的真实大小——loader 自身比例原样呈现，不套固定比例盒子、
-    // 不被信箱化、不被裁切。view 缺省即等待态的小方块（32×16）。
+    const slot = view ?? UV_USE_VIEW;
     const ow = uv.width || 48;
     const oh = uv.height || 48;
-    const maxW = view?.w ?? 32;
-    const maxH = view?.h ?? 16;
-    const scale = Math.min(maxW / ow, maxH / oh);
-    box.style.width = `${(ow * scale).toFixed(2)}px`;
-    box.style.height = `${(oh * scale).toFixed(2)}px`;
+    // 先按 CSS 估一个尺寸，避免测量前空白；挂上文档后 fitUvBox 会按真实排版改掉
+    box.dataset.uvMaxW = String(slot.w);
+    box.dataset.uvMaxH = String(slot.h);
+    box.dataset.uvCap = slot.cap ? '1' : '0';
+    box.dataset.uvOw = String(ow);
+    box.dataset.uvOh = String(oh);
+    box.style.visibility = 'hidden';
     const host = el('div', 'uv-host');
-    host.style.width = `${ow}px`;
-    host.style.height = `${oh}px`;
-    host.style.transform = `scale(${scale.toFixed(4)})`;
-    host.style.transformOrigin = 'top left';
     const shadow = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
     // 外部样式进不了 Shadow DOM，减少动效的偏好得在这里再写一遍
@@ -1770,6 +1911,8 @@ function makeLoader(
     body.innerHTML = DOMPurify.sanitize(uv.html);
     shadow.append(style, body);
     box.appendChild(host);
+    applyUvFrame(box, host, ow, oh, 0, 0, slot.w, slot.h, slot.cap);
+    queueUvFit(box);
   } else {
     for (let i = 0; i < 3; i++) box.appendChild(el('span'));
   }
@@ -1783,7 +1926,7 @@ function applyLoader(kind: LoaderKind, uv?: UvLoaderData): void {
   // 各款 DOM 结构不同（卡车是 SVG、在线款是 Shadow DOM），直接换节点最省心
   document.querySelectorAll<HTMLElement>('.thinking').forEach((box) => {
     const old = box.querySelector('.loader');
-    if (old) old.replaceWith(makeLoader(kind, nextUv));
+    if (old) old.replaceWith(makeLoader(kind, nextUv, kind === 'uv' ? UV_USE_VIEW : undefined));
   });
   document.querySelectorAll<HTMLElement>('.loader-option').forEach((btn) => {
     btn.setAttribute('aria-checked', String(btn.dataset.kind === kind));
@@ -1838,8 +1981,8 @@ function renderUvPreview(): void {
   const card = el('div', 'uv-card');
   card.classList.toggle('active', readAppearance().loader === 'uv');
   const preview = el('span', 'loader-preview');
-  // 在线款按自身比例缩放，盒子尺寸由 JS 按缩放后真实大小给出；上限 240×140，超出才等比缩小
-  preview.appendChild(makeLoader('uv', uvCurrent, { w: 240, h: 140 }));
+  // 预览按内容真实尺寸等比放进上限，小的放大看清，大的缩小，不裁字
+  preview.appendChild(makeLoader('uv', uvCurrent, UV_PREVIEW_VIEW));
   const meta = el('div', 'uv-meta');
   const label = el('span', 'loader-opt-name');
   label.textContent = `在线样式 · ${uvCurrent.path.split('/').pop()}`;
@@ -1858,8 +2001,8 @@ function renderUvList(): void {
   const rows = uvItemsAll.map((item) => {
     const b = el('button', 'uv-item');
     b.type = 'button';
+    b.dataset.path = item.path;
     b.textContent = `${item.author} / ${item.slug}`;
-    b.onclick = () => void pickUv(item.path, b);
     return b;
   });
   $<HTMLElement>('#uvList').replaceChildren(...rows);
@@ -1920,7 +2063,7 @@ function thinkingBlock(text: string): HTMLElement {
   label.textContent = text;
   const clock = el('span', 'thinking-clock');
   clock.textContent = '0ms';
-  box.append(makeLoader(a.loader, a.uv), label, clock);
+  box.append(makeLoader(a.loader, a.uv, a.loader === 'uv' ? UV_USE_VIEW : undefined), label, clock);
   return box;
 }
 
@@ -2558,6 +2701,12 @@ renderUvPreview();
 // 联网只在人点这一下时发生，开机与对话都不主动请求外部站点
 $<HTMLButtonElement>('#uvFetch').addEventListener('click', () => void fetchUvList(false));
 $<HTMLButtonElement>('#uvMore').addEventListener('click', () => void fetchUvList(true));
+// 列表项只带 data-path，点击统一进 pickUv，探针也能塞一款指定组件进来验缩放
+$<HTMLElement>('#uvList').addEventListener('click', (ev) => {
+  const b = (ev.target as HTMLElement).closest<HTMLElement>('.uv-item');
+  if (!b?.dataset.path) return;
+  void pickUv(b.dataset.path, b);
+});
 refresh();
 
 export { };

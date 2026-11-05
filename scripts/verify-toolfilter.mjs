@@ -228,6 +228,54 @@ const PROBE = `(async () => {
     error: null,
   };
 
+  // 文字款（silent-earwig-10 的 “Loading...”）CSS 不写宽高。旧逻辑按 48px 裁成 “Loa”。
+  // 预览要装下整段字；等待态只等比缩小，同样不能裁。
+  if (uvItems.length) {
+    const earwigBtn = document.createElement('button');
+    earwigBtn.className = 'uv-item';
+    earwigBtn.type = 'button';
+    earwigBtn.dataset.path = '/andrew-demchenk0/silent-earwig-10';
+    q('#uvList').appendChild(earwigBtn);
+    earwigBtn.click();
+    let eh = null;
+    for (let i = 0; i < 40; i++) {
+      await sleep(200);
+      eh = q('#uvPreview .uv-host');
+      const g = eh && eh.shadowRoot ? eh.shadowRoot.querySelector('.glitch') : null;
+      if (eh && eh.dataset.uvFit === '1' && g) break;
+    }
+    const g = eh && eh.shadowRoot ? eh.shadowRoot.querySelector('.glitch') : null;
+    if (eh && g) {
+      const hr = eh.getBoundingClientRect();
+      const gr = g.getBoundingClientRect();
+      appearance.uvOnline.earwigW = Math.round(gr.width);
+      appearance.uvOnline.earwigBoxW = Math.round(hr.width);
+      appearance.uvOnline.earwigOk = gr.width > 80
+        && gr.left >= hr.left - 3 && gr.right <= hr.right + 3
+        && gr.top >= hr.top - 3 && gr.bottom <= hr.bottom + 3;
+    } else {
+      appearance.uvOnline.earwigOk = false;
+    }
+    let lh = null;
+    for (let i = 0; i < 20; i++) {
+      lh = q('#viewSettings .thinking .loader[data-kind="uv"] .uv-host');
+      if (lh && lh.dataset.uvFit === '1' && lh.shadowRoot && lh.shadowRoot.querySelector('.glitch')) break;
+      await sleep(100);
+    }
+    const lg = lh && lh.shadowRoot ? lh.shadowRoot.querySelector('.glitch') : null;
+    if (lh && lg) {
+      const hr = lh.getBoundingClientRect();
+      const gr = lg.getBoundingClientRect();
+      appearance.uvOnline.earwigLiveW = Math.round(gr.width);
+      appearance.uvOnline.earwigLiveBoxW = Math.round(hr.width);
+      appearance.uvOnline.earwigLiveOk = gr.width > 36
+        && gr.left >= hr.left - 3 && gr.right <= hr.right + 3
+        && gr.top >= hr.top - 3 && gr.bottom <= hr.bottom + 3;
+    } else {
+      appearance.uvOnline.earwigLiveOk = false;
+    }
+  }
+
   return JSON.stringify({
     appearance,
     keys,
@@ -302,6 +350,7 @@ const checks = [
   ['在线样式解码干净且 CSS 类名能对上 HTML', !r.appearance.uvOnline.ok || (r.appearance.uvOnline.hasAnim === true && r.appearance.uvOnline.htmlClean === true && r.appearance.uvOnline.classMatch === true)],
   ['分页能加载下一页并累积条目', r.appearance.uvMoreHiddenBefore === true && (!r.appearance.uvOnline.ok || r.appearance.uvOnline.moreAdded > 0)],
   ['在线样式等比缩放完整不裁切', !r.appearance.uvOnline.ok || r.appearance.uvOnline.fitOk === true],
+  ['文字款拉取后完整落入预览并在等待态等比缩小', !r.appearance.uvOnline.ok || (r.appearance.uvOnline.earwigOk === true && r.appearance.uvOnline.earwigLiveOk === true)],
 ];
 
 let bad = 0;
