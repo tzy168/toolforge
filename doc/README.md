@@ -22,7 +22,7 @@
 | 04 | [创建、测试、定级与入库](./04-create-tool.md) | `create_tool` 怎样把想法变成能力？ | `src/agent/meta-tools.ts`、`src/core/review.ts` |
 | 05 | [执行闸门、权限与隔离](./05-execution-security.md) | 调用如何被校验、执行、审计？ | `src/core/bus.ts`、`src/executors/` |
 | 06 | [工具召回、上下文与缓存](./06-context-cache.md) | 工具变多以后怎样控制上下文？ | `src/core/retrieve.ts`、`src/index.ts` |
-| 07 | [桌面状态、IPC 与 MCP](./07-ui-and-mcp.md) | 核心如何接入界面和外部工具？ | `electron/`、`src/ui/`、`src/mcp/` |
+| 07 | [桌面端、IPC 与 MCP](./07-ui-and-mcp.md) | 核心如何接入界面和外部工具？ | `electron/`、`src/ui/`、`src/mcp/` |
 | 08 | [扩展系统与验证设计](./08-extend-and-verify.md) | 如何安全地加能力并证明没改坏？ | `test/`、`scripts/`、`AGENTS.md` |
 
 ## 先记住这五个不变量
