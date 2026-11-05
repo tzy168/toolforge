@@ -23,6 +23,9 @@ contextBridge.exposeInMainWorld('tf', {
   about: () => ipcRenderer.invoke('tf:about'),
   checkUpdate: () => ipcRenderer.invoke('tf:checkUpdate'),
   openExternal: (url: string) => ipcRenderer.invoke('tf:openExternal', url),
+  // 在线 loader 目录：只读公开页面，主进程代拉并净化，渲染层不碰网络
+  loaderList: (page?: number) => ipcRenderer.invoke('tf:loaderList', page),
+  loaderCss: (path: string) => ipcRenderer.invoke('tf:loaderCss', path),
   onEvent: (cb: (event: unknown) => void) => {
     ipcRenderer.on('tf:event', (_e, data) => cb(data));
   },

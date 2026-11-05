@@ -1,7 +1,7 @@
 const electron = require('electron') as typeof import('electron');
 const path = require('node:path') as typeof import('node:path');
 const fs = require('node:fs') as typeof import('node:fs');
-const { app, BrowserWindow, ipcMain, shell, dialog } = electron;
+const { app, BrowserWindow, ipcMain, shell, dialog, net } = electron;
 
 type Forge = import('../src/index.js', { with: { 'resolution-mode': 'import' } }).ToolForge;
 
@@ -176,6 +176,109 @@ async function checkUpdate(): Promise<Record<string, unknown>> {
   }
   return { current: APP_VERSION, latest, hasUpdate: cmpVersion(latest, APP_VERSION) > 0, source, url, notes, publishedAt };
 }
+
+/* ---------------- Uiverse 在线 loader 目录 ---------------- */
+
+/**
+ * Node 内置 fetch 的 TLS 指纹会被 Cloudflare 挡成 403，所以这里走 Electron 的
+ * net.fetch（Chromium 网络栈）。只放行 uiverse.io 下的组件路径，别让 IPC 变成任意代理。
+ * 联网只在用户点「获取在线样式」时发生，开机与对话都不碰网络。
+ */
+const UV_ORIGIN = 'https://uiverse.io';
+const UV_POST = /^\/([A-Za-z0-9_-]+)\/([a-z]+-[a-z]+-\d+)$/;
+
+async function uvPage(pathname: string): Promise<string> {
+  const res = await net.fetch(UV_ORIGIN + pathname, {
+    headers: { accept: 'text/html' },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`Uiverse 返回 ${res.status}`);
+  return res.text();
+}
+
+/**
+ * 列表页 ?page=1 是第 2 页（不带参数才是第 1 页），每页约 34 款。
+ * 页码上限做一道夹逼，免得 IPC 被人拿去当任意翻页器刷站。
+ */
+async function loaderList(page = 0): Promise<Array<{ author: string; slug: string; path: string }>> {
+  const n = Number.isFinite(page) ? Math.min(Math.max(Math.floor(page), 0), 50) : 0;
+  const html = await uvPage(n === 0 ? '/loaders' : `/loaders?page=${n}`);
+  const re = /href="\/([A-Za-z0-9_-]+)\/([a-z]+-[a-z]+-\d+)"/g;
+  const seen = new Set<string>();
+  const out: Array<{ author: string; slug: string; path: string }> = [];
+  for (const m of html.matchAll(re)) {
+    const path = `/${m[1]}/${m[2]}`;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    out.push({ author: m[1], slug: m[2], path });
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+
+/** 组件页把 HTML/CSS 塞在一段 JSON 字符串里，\n 与 HTML 实体都是字面量，先还原 */
+function decodeSnippet(raw: string): string {
+  return raw
+    .replace(/\\n/g, '\n')
+    .replace(/\\"/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    // 页面里属性写成 class=\&quot;loader\&quot;：实体前那道反斜杠必须一起吃掉，
+    // 否则解出来是 class=\"loader\"，类名带反斜杠，Shadow DOM 里 CSS 一条都匹配不上。
+    .replace(/\\?&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\\"/g, '"');
+}
+
+/**
+ * 原尺寸只用来算等比缩放。只认规则块里独立声明的 width/height，
+ * 避开 border-width 这类子串；也认 --size: 70px 的变量写法。
+ * 取见到的最大值，宁可多缩一点也不能把大场景裁掉。
+ */
+function loaderSize(css: string): { width: number; height: number } {
+  const dim = (prop: string): number | null => {
+    const re = new RegExp('(?:^|[;{]\\s*)' + prop + '\\s*:\\s*(\\d+(?:\\.\\d+)?)px', 'gm');
+    const vals = [...css.matchAll(re)].map((m) => Number(m[1])).filter((n) => n > 0);
+    return vals.length ? Math.max(...vals) : null;
+  };
+  const varVals = [...css.matchAll(/--[\w-]+\s*:\s*(\d+(?:\.\d+)?)px/g)].map((m) => Number(m[1]));
+  const fallback = varVals.length ? Math.max(...varVals) : 48;
+  return { width: dim('width') ?? fallback, height: dim('height') ?? fallback };
+}
+
+/** 样式只在 Shadow DOM 里生效，但外链、固定定位与脚本痕迹仍要掐掉 */
+function safeLoaderCss(css: string): string {
+  return css
+    .replace(/@import[^;]*;/gi, '')
+    .replace(/url\(\s*[^)]*\)/gi, 'none')
+    .replace(/expression\s*\([^)]*\)/gi, '0')
+    .replace(/(-moz-binding|behavior)\s*:[^;]*;?/gi, '')
+    .replace(/position\s*:\s*fixed/gi, 'position: absolute')
+    .slice(0, 12000);
+}
+
+async function loaderCss(path: string): Promise<{ css: string; html: string; width: number; height: number }> {
+  if (!UV_POST.test(path)) throw new Error('不是有效的 Uiverse 组件地址');
+  const page = await uvPage(path);
+  const htmlAt = page.indexOf('&lt;!-- HTML --&gt;');
+  const cssAt = page.indexOf('/* CSS */');
+  if (htmlAt < 0 || cssAt < 0 || cssAt < htmlAt) throw new Error('这个组件页解析不出 CSS/HTML');
+  const end = page.indexOf('&quot;,&quot;author', cssAt);
+  const raw = page.slice(cssAt, end > cssAt ? end : cssAt + 12000);
+  const block = decodeSnippet(raw);
+  const css = safeLoaderCss(block.slice(block.indexOf('*/') + 2));
+  const html = decodeSnippet(page.slice(htmlAt, cssAt))
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*')/gi, '')
+    .replace(/javascript:/gi, '')
+    .slice(0, 4000);
+  const size = loaderSize(css);
+  return { css, html, width: size.width, height: size.height };
+}
+
+ipcMain.handle('tf:loaderList', guard((_e: unknown, page?: number) => loaderList(Number(page) || 0)));
+ipcMain.handle('tf:loaderCss', guard((_e: unknown, path: string) => loaderCss(String(path))));
 
 ipcMain.handle(
   'tf:about',

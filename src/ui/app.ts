@@ -114,6 +114,9 @@ interface Bridge {
   checkUpdate: () => Promise<Envelope<UpdateInfo>>;
   /** 在系统浏览器里打开链接（只放行 https） */
   openExternal: (url: string) => Promise<Envelope<unknown>>;
+  /** Uiverse 在线目录：主进程代拉并净化，渲染层只拿 CSS/HTML 片段 */
+  loaderList: (page?: number) => Promise<Envelope<Array<{ author: string; slug: string; path: string }>>>;
+  loaderCss: (path: string) => Promise<Envelope<{ css: string; html: string; width: number; height: number }>>;
   onEvent: (cb: (event: EventPayload) => void) => void;
 }
 
@@ -577,33 +580,10 @@ function emptyState(): HTMLElement {
   const box = el('div', 'empty');
   box.id = 'empty';
 
-  // 口号拆成逐字符的 span，靠 CSS 变量错开延迟，做出「一格一格成形」的入场。
-  // 效果移植自 ReactBits 的 Split Text / Shiny Text / Blur Text，纯 CSS 实现。
+  // 整行一次淡入即可：逐字错峰 + 模糊 + 高光叠上去，开场要两秒才静得下来。
+  // 直接写文本，读屏器也不用再靠 aria-label 补一句。
   const hero = el('h1', 'hero');
-  hero.setAttribute('aria-label', 'Forge what is missing');
-  // 读屏器读整句，视觉上是一堆 span 挨个亮起来，所以把碎片标成装饰
-  const frag = el('span', 'hero-frag');
-  frag.setAttribute('aria-hidden', 'true');
-  let seq = 0;
-  for (const word of ['Forge', 'what’s', 'missing.']) {
-    const w = el('span', 'hero-word');
-    // 关键词：整词一起承载光泽。逐字母各挂一条渐变会碎成噪点
-    if (seq === 0) {
-      w.classList.add('hero-key');
-      // 伪元素要高光层复刻文字，得把原文放进去
-      w.dataset.text = word;
-    }
-    for (const ch of word) {
-      const c = el('span', 'hero-ch');
-      c.textContent = ch;
-      c.style.setProperty('--i', String(seq++));
-      w.appendChild(c);
-    }
-    frag.appendChild(w);
-    // 词间补一个真实空格，保证复制出来的文本可读
-    frag.appendChild(document.createTextNode(' '));
-  }
-  hero.appendChild(frag);
+  hero.textContent = 'Forge what’s missing.';
 
   const sub = el('p', 'hero-sub');
   sub.append('凡能力皆为工具——没有现成的，就');
@@ -1688,28 +1668,270 @@ function stopTicker(): void {
   ticker = null;
 }
 
-/** 等待态：驶过的卡车 + 文案 + 秒表。标记只给读屏，画面本身不参与朗读 */
+/* ---------------- 外观偏好：等待动画 ---------------- */
+
+/**
+ * 纯渲染层的显示偏好，只写 localStorage：不涉权限、不涉密钥，没必要动主进程的
+ * settings.json。存成对象是为了以后加字号、密度时不必换 key。
+ */
+const APPEARANCE_KEY = 'toolforge.appearance';
+type LoaderKind = 'dots' | 'ring' | 'bars' | 'orbit' | 'truck' | 'uv';
+
+interface UvLoaderData {
+  css: string;
+  html: string;
+  width: number;
+  height: number;
+  path: string;
+}
+
+interface Appearance {
+  loader: LoaderKind;
+  uv?: UvLoaderData;
+}
+
+/** 内置五款：四款自写纯 CSS + 原彩蛋卡车；在线款不进这张表，单独存数据 */
+const LOADER_STYLES: Array<{ kind: LoaderKind; name: string; note: string }> = [
+  { kind: 'dots', name: '墨点呼吸', note: '三点依次明暗，默认' },
+  { kind: 'ring', name: '细环旋转', note: '单环匀速转动' },
+  { kind: 'bars', name: '竖条节拍', note: '三竖条错峰起伏' },
+  { kind: 'orbit', name: '轨道小点', note: '一点沿细环绕行' },
+  { kind: 'truck', name: '驶过卡车', note: '原彩蛋 · Uiverse / vinodjangid07' },
+];
+
+function readAppearance(): Appearance {
+  try {
+    const raw = JSON.parse(localStorage.getItem(APPEARANCE_KEY) || '{}');
+    const kinds = LOADER_STYLES.map((s) => s.kind).concat('uv');
+    if (kinds.includes(raw.loader)) {
+      const uv = raw.uv && typeof raw.uv.css === 'string' ? (raw.uv as UvLoaderData) : undefined;
+      // 存了 uv 却没有样式数据属于坏偏好，退回默认
+      if (raw.loader !== 'uv' || uv) return { loader: raw.loader as LoaderKind, uv };
+    }
+  } catch {
+    /* 坏数据回默认 */
+  }
+  return { loader: 'dots' };
+}
+
+function writeAppearance(a: Appearance): void {
+  try {
+    localStorage.setItem(APPEARANCE_KEY, JSON.stringify(a));
+  } catch {
+    /* 存不下也照常切换，只是下次开机回默认 */
+  }
+}
+
+/**
+ * 等待态与设置页预览共用一份外层：内置款靠 data-kind、卡车克隆模板、
+ * 在线款放进 Shadow DOM（第三方样式天然隔离）。都锁在 32×16 的 .loader 里，
+ * 切换不会改动行高。
+ */
+function makeLoader(
+  kind: LoaderKind = readAppearance().loader,
+  uv?: UvLoaderData,
+  view?: { w: number; h: number }
+): HTMLElement {
+  if (kind === 'truck') {
+    const tpl = $<HTMLTemplateElement>('#truckLoader');
+    const node = tpl.content.firstElementChild?.cloneNode(true) as HTMLElement;
+    node.dataset.kind = 'truck';
+    node.setAttribute('aria-hidden', 'true');
+    return node;
+  }
+
+  const box = el('div', 'loader');
+  box.dataset.kind = kind;
+  box.setAttribute('aria-hidden', 'true');
+  if (kind === 'uv' && uv) {
+    // 在线款：按主进程解析到的原生尺寸 ow×oh，等比缩放到「不超过 view 上限」，
+    // 盒子尺寸直接取缩放后的真实大小——loader 自身比例原样呈现，不套固定比例盒子、
+    // 不被信箱化、不被裁切。view 缺省即等待态的小方块（32×16）。
+    const ow = uv.width || 48;
+    const oh = uv.height || 48;
+    const maxW = view?.w ?? 32;
+    const maxH = view?.h ?? 16;
+    const scale = Math.min(maxW / ow, maxH / oh);
+    box.style.width = `${(ow * scale).toFixed(2)}px`;
+    box.style.height = `${(oh * scale).toFixed(2)}px`;
+    const host = el('div', 'uv-host');
+    host.style.width = `${ow}px`;
+    host.style.height = `${oh}px`;
+    host.style.transform = `scale(${scale.toFixed(4)})`;
+    host.style.transformOrigin = 'top left';
+    const shadow = host.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    // 外部样式进不了 Shadow DOM，减少动效的偏好得在这里再写一遍
+    style.textContent =
+      uv.css +
+      '\n@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }';
+    const body = document.createElement('div');
+    // 主进程已洗过一次，这里再用 DOMPurify 兜住标签与事件属性
+    body.innerHTML = DOMPurify.sanitize(uv.html);
+    shadow.append(style, body);
+    box.appendChild(host);
+  } else {
+    for (let i = 0; i < 3; i++) box.appendChild(el('span'));
+  }
+  return box;
+}
+
+function applyLoader(kind: LoaderKind, uv?: UvLoaderData): void {
+  const prev = readAppearance();
+  const nextUv = kind === 'uv' ? uv : prev.uv;
+  writeAppearance({ loader: kind, uv: nextUv });
+  // 各款 DOM 结构不同（卡车是 SVG、在线款是 Shadow DOM），直接换节点最省心
+  document.querySelectorAll<HTMLElement>('.thinking').forEach((box) => {
+    const old = box.querySelector('.loader');
+    if (old) old.replaceWith(makeLoader(kind, nextUv));
+  });
+  document.querySelectorAll<HTMLElement>('.loader-option').forEach((btn) => {
+    btn.setAttribute('aria-checked', String(btn.dataset.kind === kind));
+  });
+  const uvCard = $<HTMLElement>('#uvPreview .uv-card');
+  if (uvCard) uvCard.classList.toggle('active', kind === 'uv');
+}
+
+/** 内置选项由这张表生成，加一款只需多一条 LOADER_STYLES + 一组 CSS */
+function renderLoaderOptions(): void {
+  const host = $<HTMLElement>('#loaderOptions');
+  const active = readAppearance();
+  const cards = LOADER_STYLES.map(({ kind, name, note }) => {
+    const btn = el('button', 'loader-option');
+    btn.type = 'button';
+    btn.dataset.kind = kind;
+    btn.setAttribute('role', 'radio');
+    btn.setAttribute('aria-checked', String(kind === active.loader));
+    const preview = el('span', 'loader-preview');
+    preview.appendChild(makeLoader(kind));
+    const label = el('span', 'loader-opt-name');
+    label.textContent = name;
+    const desc = el('span', 'loader-opt-note');
+    desc.textContent = note;
+    btn.append(preview, label, desc);
+    btn.onclick = () => applyLoader(kind);
+    return btn;
+  });
+  host.replaceChildren(...cards);
+}
+
+/* ---------------- 在线目录（Uiverse Loaders） ---------------- */
+
+/** 上次取回的在线样式；开机时从偏好里恢复，刷新后不用重新下载 */
+let uvCurrent: UvLoaderData | undefined = readAppearance().uv;
+/** 在线目录按页累积，点「加载下一页」接着 ?page=N 往后取 */
+let uvPage = 0;
+let uvItemsAll: Array<{ author: string; slug: string; path: string }> = [];
+
+function setUvStatus(text: string): void {
+  $<HTMLElement>('#uvStatus').textContent = text;
+}
+
+function renderUvPreview(): void {
+  const box = $<HTMLElement>('#uvPreview');
+  if (!uvCurrent) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  box.hidden = false;
+  const card = el('div', 'uv-card');
+  card.classList.toggle('active', readAppearance().loader === 'uv');
+  const preview = el('span', 'loader-preview');
+  // 在线款按自身比例缩放，盒子尺寸由 JS 按缩放后真实大小给出；上限 240×140，超出才等比缩小
+  preview.appendChild(makeLoader('uv', uvCurrent, { w: 240, h: 140 }));
+  const meta = el('div', 'uv-meta');
+  const label = el('span', 'loader-opt-name');
+  label.textContent = `在线样式 · ${uvCurrent.path.split('/').pop()}`;
+  const note = el('span', 'loader-opt-note');
+  note.textContent = '来自 uiverse.io · Shadow DOM 隔离';
+  meta.append(label, note);
+  const use = el('button', 'ghost solid uv-use');
+  use.type = 'button';
+  use.textContent = '设为等待动画';
+  use.onclick = () => applyLoader('uv', uvCurrent);
+  card.append(preview, meta, use);
+  box.replaceChildren(card);
+}
+
+function renderUvList(): void {
+  const rows = uvItemsAll.map((item) => {
+    const b = el('button', 'uv-item');
+    b.type = 'button';
+    b.textContent = `${item.author} / ${item.slug}`;
+    b.onclick = () => void pickUv(item.path, b);
+    return b;
+  });
+  $<HTMLElement>('#uvList').replaceChildren(...rows);
+  $<HTMLButtonElement>('#uvMore').hidden = uvItemsAll.length === 0;
+}
+
+/** ?page=1 是第 2 页：第一页不带参数，之后按 uvPage + 1 往后翻并累积去重 */
+async function fetchUvList(next = false): Promise<void> {
+  const btn = $<HTMLButtonElement>(next ? '#uvMore' : '#uvFetch');
+  btn.disabled = true;
+  setUvStatus(next ? '正在加载下一页…' : '正在获取…');
+  const page = next ? uvPage + 1 : 0;
+  const res = await window.tf?.loaderList(page);
+  btn.disabled = false;
+  if (!res?.ok) {
+    setUvStatus(`获取失败：${res?.error || '桥不可用'}`);
+    return;
+  }
+  const items = res.data;
+  if (!next) {
+    uvItemsAll = [];
+    uvPage = 0;
+  }
+  const seen = new Set(uvItemsAll.map((i) => i.path));
+  for (const item of items) {
+    if (!seen.has(item.path)) {
+      uvItemsAll.push(item);
+      seen.add(item.path);
+    }
+  }
+  uvPage = page;
+  setUvStatus(`已取回 ${uvItemsAll.length} 款（第 ${uvPage + 1} 页），点一款下载样式`);
+  renderUvList();
+  // 空页说明翻到头了，别再让人白点
+  $<HTMLButtonElement>('#uvMore').hidden = items.length === 0;
+}
+
+async function pickUv(path: string, btn: HTMLElement): Promise<void> {
+  setUvStatus('正在取回样式…');
+  const res = await window.tf?.loaderCss(path);
+  if (!res?.ok) {
+    setUvStatus(`样式取回失败：${res?.error || '桥不可用'}`);
+    return;
+  }
+  uvCurrent = { ...res.data, path };
+  setUvStatus('已取回，可设为等待动画');
+  document.querySelectorAll<HTMLElement>('.uv-item').forEach((n) => n.classList.toggle('active', n === btn));
+  renderUvPreview();
+  // 当前正在用的就是在线款时，立刻换上新取回的样式
+  if (readAppearance().loader === 'uv') applyLoader('uv', uvCurrent);
+}
+
+/** 等待态：一个尺寸固定的小动效 + 文案 + 秒表 */
 function thinkingBlock(text: string): HTMLElement {
+  const a = readAppearance();
   const box = el('div', 'thinking');
-  // 模板在 index.html 里，克隆一份就能用；别把整段 SVG 写进这里
-  const frag = $<HTMLTemplateElement>('#truckLoader').content.cloneNode(true) as DocumentFragment;
-  frag.querySelector('.loader')?.setAttribute('aria-hidden', 'true');
   const label = el('span', 'thinking-label');
   label.textContent = text;
   const clock = el('span', 'thinking-clock');
   clock.textContent = '0ms';
-  box.append(frag, label, clock);
+  box.append(makeLoader(a.loader, a.uv), label, clock);
   return box;
 }
 
-/** 换一句等待文案。重放一次模糊收束，让「第 2 步」这种变化看得出来 */
+/** 换一句等待文案时轻淡入一次，让「第 2 步」这种变化看得出来 */
 function setThinkingLabel(text: string): void {
   const label = inner.querySelector<HTMLElement>('.thinking-label');
   if (!label) return;
   label.textContent = text;
-  label.classList.remove('blur-in');
-  void label.offsetWidth; // 强制回流，动画才会重播
-  label.classList.add('blur-in');
+  label.classList.remove('label-in');
+  void label.offsetWidth;
+  label.classList.add('label-in');
 }
 
 /** 出错态：给气泡加个红色左边框，别让错误混在正常回答里 */
@@ -1799,7 +2021,7 @@ function forceFinish(taskId: string, message: string): void {
 }
 
 /**
- * 顶栏显示上一轮的缓存命中率。
+ * 设置页「运行环境」显示上一轮的缓存命中率。
  *
  * 命中率是「前缀有没有被自己打散」的唯一直接证据：一改提示词、一换工具集、
  * 历史一滑动，数字立刻掉下来。没有这个数，优化只能靠猜。
@@ -2331,6 +2553,11 @@ function queueReplyPaint(): void {
 // 历史任务仍在左栏里，点一下就回去。
 openTask(null);
 showView('chat');
+renderLoaderOptions();
+renderUvPreview();
+// 联网只在人点这一下时发生，开机与对话都不主动请求外部站点
+$<HTMLButtonElement>('#uvFetch').addEventListener('click', () => void fetchUvList(false));
+$<HTMLButtonElement>('#uvMore').addEventListener('click', () => void fetchUvList(true));
 refresh();
 
 export { };

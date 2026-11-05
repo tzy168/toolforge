@@ -5,7 +5,8 @@
  *   node scripts/verify-toolfilter.mjs
  *
  * 做法：起 Electron 打开设置页，在真实 DOM 上点 tab、敲搜索框，
- * 断言「按等级筛 / 按名称模糊搜 / 两者叠加 / 空状态 / 刷新后条件不丢」都成立。
+ * 断言「按等级筛 / 按名称模糊搜 / 两者叠加 / 空状态 / 刷新后条件不丢」都成立；
+ * 顺带验「外观」里的等待动画切换、等待态同步与偏好持久化。
  * 和 verify-switch.mjs 一样走 TF_SMOKE 通道，不需要额外的测试框架。
  */
 import { spawn } from 'node:child_process';
@@ -120,7 +121,115 @@ const PROBE = `(async () => {
   const restored = rows().length;
   const emptyHiddenAfter = q('#toolEmpty').hidden;
 
+  // ---- 顺带验「外观」：等待动画可切换、只同步等待态、不动预览 ----
+  const apNav = q('.nav-item[data-pane="appearance"]');
+  const apPane = q('.pane[data-pane="appearance"]');
+  const apCards = () => [...document.querySelectorAll('#loaderOptions .loader-option')];
+  const apChecked = () => {
+    const a = apCards().find((b) => b.getAttribute('aria-checked') === 'true');
+    return a ? a.dataset.kind : null;
+  };
+  if (apNav) apNav.click();
+  await sleep(120);
+  const apKinds = apCards().map((b) => b.dataset.kind);
+  const apDefault = apChecked();
+  const apPreviewBefore = apCards().map((b) => b.querySelector('.loader').dataset.kind);
+  // 造一个等待态 loader，模拟流式中正在显示的那一个
+  const apFake = document.createElement('div');
+  apFake.className = 'thinking';
+  const apLive = document.createElement('div');
+  apLive.className = 'loader';
+  apLive.dataset.kind = 'dots';
+  apFake.appendChild(apLive);
+  q('#viewSettings').appendChild(apFake);
+  const apRing = apCards().find((b) => b.dataset.kind === 'ring');
+  if (apRing) apRing.click();
+  await sleep(80);
+  const appearance = {
+    hasNav: !!apNav,
+    paneVisible: !!apPane && !apPane.hidden,
+    kinds: apKinds,
+    defaultKind: apDefault,
+    checkedAfter: apChecked(),
+    checkedCount: apCards().filter((b) => b.getAttribute('aria-checked') === 'true').length,
+    stored: localStorage.getItem('toolforge.appearance'),
+    // applyLoader 是整节点替换，别拿旧的 apLive 引用看结果
+    liveKind: apFake.querySelector('.loader') ? apFake.querySelector('.loader').dataset.kind : null,
+    liveReplaced: !apFake.contains(apLive),
+    previewBefore: apPreviewBefore,
+    previewAfter: apCards().map((b) => b.querySelector('.loader').dataset.kind),
+    uvFetch: !!q('#uvFetch'),
+    uvMoreHiddenBefore: q('#uvMore') ? q('#uvMore').hidden : false,
+    uvListEmpty: q('#uvList') ? q('#uvList').children.length === 0 : false,
+    uvPreviewHidden: q('#uvPreview') ? q('#uvPreview').hidden : false,
+    truckSvg: !!(apCards().find((b) => b.dataset.kind === 'truck') || { querySelector: () => null }).querySelector('svg'),
+  };
+
+  // 真实走一遍在线 UI：点「获取」→ 点第一款 → 设为等待动画，验 Shadow DOM 隔离。
+  // 离线时列表为空，相关断言跳过，不制造假红。
+  q('#uvFetch').click();
+  let uvItems = [];
+  for (let i = 0; i < 40 && !uvItems.length; i++) {
+    await sleep(200);
+    uvItems = [...document.querySelectorAll('#uvList .uv-item')];
+  }
+  const uvStatusText = q('#uvStatus') ? q('#uvStatus').textContent : '';
+  if (uvItems.length) {
+    uvItems[0].click();
+    for (let i = 0; i < 40 && !q('#uvPreview .uv-use'); i++) await sleep(200);
+  }
+  const uvUse = q('#uvPreview .uv-use');
+  if (uvUse) uvUse.click();
+  await sleep(120);
+  // 真实点一次「加载下一页」，列表条目应累积变多
+  const beforeMore = document.querySelectorAll('#uvList .uv-item').length;
+  const moreBtn = q('#uvMore');
+  if (moreBtn && !moreBtn.hidden) moreBtn.click();
+  for (let i = 0; i < 40; i++) {
+    await sleep(200);
+    if (document.querySelectorAll('#uvList .uv-item').length > beforeMore) break;
+  }
+  const moreAdded = document.querySelectorAll('#uvList .uv-item').length - beforeMore;
+  // 等比缩放后内容必须完整落在预览盒里，且预览盒按 loader 自身比例（不撑固定信箱）
+  const fitHost = document.querySelector('#uvPreview .uv-host');
+  const fitBox = fitHost ? fitHost.closest('.loader') : null;
+  const fitScale = fitHost ? Number((fitHost.style.transform.split('scale(')[1] || '').split(')')[0] || '0') : 0;
+  const fitW = fitHost ? parseFloat(fitHost.style.width) : 0;
+  const fitH = fitHost ? parseFloat(fitHost.style.height) : 0;
+  const fitOk = !!(fitHost && fitBox && fitScale > 0
+    && fitW * fitScale <= fitBox.clientWidth + 1
+    && fitH * fitScale <= fitBox.clientHeight + 1
+    // 盒子比例必须≈loader 原生比例：证明没被塞进固定 160×84 信箱
+    && Math.abs((fitBox.clientWidth / fitBox.clientHeight) - (fitW / fitH)) < 0.05);
+  const uvLive = apFake.querySelector('.loader');
+  const uvHost = uvLive ? uvLive.querySelector('.uv-host') : null;
+  const uvShadow = uvHost ? uvHost.shadowRoot : null;
+  const uvCss = uvShadow && uvShadow.querySelector('style') ? uvShadow.querySelector('style').textContent : '';
+  const uvBody = uvShadow ? uvShadow.querySelector('div') : null;
+  const uvHtml = uvBody ? uvBody.innerHTML : '';
+  // 组件页把属性写成 \&quot;xxx\&quot;，解码漏掉反斜杠会让类名匹配不上、预览全白。
+  // 注意整段 PROBE 是模板字符串，检查式里别写反斜杠转义（会被模板层吃掉一层）。
+  const uvClasses = [...new Set([...uvCss.matchAll(/[.]([A-Za-z][A-Za-z0-9_-]*)[ {,:]/g)].map((m) => m[1]))];
+  appearance.uvOnline = {
+    ok: uvItems.length > 0,
+    count: uvItems.length,
+    cssOk: !!q('#uvPreview .uv-card'),
+    shadowOk: !!(uvShadow && uvShadow.querySelector('style')),
+    hasAnim: /animation:|@keyframes/.test(uvCss),
+    htmlClean: uvHtml.length > 10 && uvHtml.indexOf(String.fromCharCode(92)) < 0 && /class="[A-Za-z0-9_-]+"/.test(uvHtml),
+    classMatch: uvClasses.some((c) => uvHtml.includes('class="' + c + '"')),
+    htmlSample: uvHtml.slice(0, 240),
+    cssSample: uvCss.slice(0, 200),
+    liveKind: uvLive ? uvLive.dataset.kind : null,
+    statusText: uvStatusText,
+    storedKind: (() => { try { return JSON.parse(localStorage.getItem('toolforge.appearance')).loader; } catch { return null; } })(),
+    moreAdded,
+    fitOk,
+    error: null,
+  };
+
   return JSON.stringify({
+    appearance,
     keys,
     counts,
     total,
@@ -181,6 +290,18 @@ const checks = [
   ['搜不到时列表为空并给出说明', r.noneCount === 0 && r.emptyShown === true && r.emptyText.includes('zzz-not-exist-zzz')],
   ['清空搜索后恢复全部并收起空提示', r.restored === r.total && r.emptyHiddenAfter === true],
   ['刷新后等级与搜索条件不丢', r.keptAfterRefresh ? r.keptAfterRefresh.afterActive === r.keptAfterRefresh.beforeActive && r.keptAfterRefresh.queryKept === true && r.keptAfterRefresh.trusts.every((x) => x === r.keptAfterRefresh.beforeActive) : false],
+  ['设置页有「外观」入口且能打开', r.appearance.hasNav === true && r.appearance.paneVisible === true],
+  ['等待动画渲染出五款且默认墨点呼吸', r.appearance.kinds.join(',') === 'dots,ring,bars,orbit,truck' && r.appearance.defaultKind === 'dots'],
+  ['切换后选中态唯一且落在细环', r.appearance.checkedAfter === 'ring' && r.appearance.checkedCount === 1],
+  ['偏好写进 localStorage', (() => { try { return JSON.parse(r.appearance.stored).loader === 'ring'; } catch { return false; } })()],
+  ['等待态换节点并同步新样式、预览卡片不变', r.appearance.liveKind === 'ring' && r.appearance.liveReplaced === true && r.appearance.previewAfter.join(',') === r.appearance.previewBefore.join(',')],
+  ['卡车彩蛋款克隆出原始 SVG', r.appearance.truckSvg === true],
+  ['在线目录入口就位且不预先联网', r.appearance.uvFetch === true && r.appearance.uvListEmpty === true && r.appearance.uvPreviewHidden === true],
+  ['在线目录能取回列表并生成预览', !r.appearance.uvOnline.ok || (r.appearance.uvOnline.count > 0 && r.appearance.uvOnline.cssOk === true)],
+  ['在线款设为等待动画后走 Shadow DOM 隔离', !r.appearance.uvOnline.ok || (r.appearance.uvOnline.shadowOk === true && r.appearance.uvOnline.liveKind === 'uv' && r.appearance.uvOnline.storedKind === 'uv')],
+  ['在线样式解码干净且 CSS 类名能对上 HTML', !r.appearance.uvOnline.ok || (r.appearance.uvOnline.hasAnim === true && r.appearance.uvOnline.htmlClean === true && r.appearance.uvOnline.classMatch === true)],
+  ['分页能加载下一页并累积条目', r.appearance.uvMoreHiddenBefore === true && (!r.appearance.uvOnline.ok || r.appearance.uvOnline.moreAdded > 0)],
+  ['在线样式等比缩放完整不裁切', !r.appearance.uvOnline.ok || r.appearance.uvOnline.fitOk === true],
 ];
 
 let bad = 0;
@@ -190,5 +311,9 @@ for (const [name, ok] of checks) {
 }
 // 失败时把原始数据打出来，省得靠猜
 if (bad) console.log('\n  探针数据：' + JSON.stringify(r, null, 2));
+const uv = r.appearance.uvOnline;
+console.log(
+  `\n  在线目录实测：${uv.ok ? `列表 ${uv.count} 款，预览生成${uv.cssOk ? '成功' : '失败'}，Shadow 隔离${uv.shadowOk ? '成功' : '未验证'}` : `离线或不可用（${uv.statusText || uv.error || '未取回'}），已跳过`}`
+);
 console.log(`\n  结果：${checks.length - bad} 通过 / ${bad} 失败`);
 process.exit(bad === 0 && code === 0 ? 0 : 1);

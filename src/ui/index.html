@@ -21,17 +21,17 @@
     <main class="main">
       <section class="view" id="viewChat">
         <header class="top">
-          <!-- 左侧只留展开按钮（侧栏收起时出现），避免和中间页签抢位置 -->
-          <div class="top-side">
+          <!-- 两列骨架：左页签（侧栏收起时多一个展开键），右设置入口。
+               缓存率与工具数移进设置页「运行环境」，顶栏不再堆状态字。 -->
+          <div class="top-left">
             <button id="expandBtn" class="icon-btn expand-btn" title="展开侧栏" hidden>☰</button>
+            <div class="tabs">
+              <button class="tab active" data-phase="work">Work</button>
+              <button class="tab" data-phase="create">Create Tools</button>
+            </div>
           </div>
-          <div class="tabs">
-            <button class="tab active" data-phase="work">Work</button>
-            <button class="tab" data-phase="create">Create Tools</button>
-          </div>
-          <div class="top-side top-status">
-            <span id="headCache" title="上一轮请求的缓存命中率（DeepSeek 前缀缓存）" hidden></span>
-            <span id="headTools" title="可注入模型的工具数"></span>
+          <div class="top-right">
+            <button id="settingsBtn" class="settings-btn" title="设置" aria-label="设置" aria-controls="viewSettings" aria-expanded="false"><span class="settings-ico" aria-hidden="true">⚙</span><span>设置</span></button>
           </div>
         </header>
 
@@ -95,6 +95,7 @@
           <nav class="settings-nav">
             <button class="nav-item active" data-pane="tools">工具</button>
             <button class="nav-item" data-pane="model">模型</button>
+            <button class="nav-item" data-pane="appearance">外观</button>
             <button class="nav-item" data-pane="about">关于</button>
           </nav>
 
@@ -149,6 +150,7 @@
                 <h3>运行环境</h3>
                 <p class="hint" id="sandboxLine"></p>
                 <p class="hint" id="mcpLine"></p>
+                <p class="hint">可注入模型的工具数 <span id="headTools"></span>　<span id="headCache" title="上一轮请求的缓存命中率（DeepSeek 前缀缓存）" hidden></span></p>
               </div>
             </div>
 
@@ -198,6 +200,29 @@
               </div>
             </div>
 
+            <!-- 外观：纯渲染层偏好，只写 localStorage，不进主进程 settings.json。
+                 先放「等待动画」一组，以后加字号、密度不必换结构。 -->
+            <div class="pane" data-pane="appearance" hidden>
+              <div class="group">
+                <h3>等待动画</h3>
+                <p class="hint">模型还没回话时显示的小动效。尺寸固定为 32×16，切换不会撑动对话排版。</p>
+                <div id="loaderOptions" class="loader-options" role="radiogroup" aria-label="等待动画样式"></div>
+                <p class="hint">内置款式为纯 CSS 与一份 SVG 彩蛋，离线可用；尺寸固定 32×16，切换不撑动对话排版。</p>
+              </div>
+
+              <div class="group">
+                <h3>在线目录 <span class="group-note">uiverse.io / loaders</span></h3>
+                <p class="hint">点「获取」才联网，由主进程取回组件样式并放进隔离容器；离线或解析失败时内置款式照常可用。</p>
+                <div class="row uv-row">
+                  <button id="uvFetch" class="ghost" type="button">获取在线样式</button>
+                  <button id="uvMore" class="ghost" type="button" hidden>加载下一页</button>
+                  <span id="uvStatus" class="uv-status"></span>
+                </div>
+                <div id="uvList" class="uv-list"></div>
+                <div id="uvPreview" class="uv-preview" hidden></div>
+              </div>
+            </div>
+
             <!-- 关于：版本与地址都以 package.json 为准，界面只负责显示 -->
             <div class="pane" data-pane="about" hidden>
               <div class="group about-card">
@@ -231,10 +256,7 @@
     </main>
   </div>
 
-  <!-- 设置入口固定在窗口左下角 -->
-  <button id="settingsBtn" class="settings-btn" title="设置" aria-label="设置" aria-controls="viewSettings" aria-expanded="false">⚙</button>
-
-  <!-- 等待态卡车。thinkingBlock 克隆这份，不直接显示。来源 Uiverse / vinodjangid07 -->
+  <!-- 等待态「驶过卡车」款式：makeLoader 克隆这份，不直接显示。来源 Uiverse / vinodjangid07 -->
   <template id="truckLoader">
     <div class="loader">
       <div class="truckWrapper">
