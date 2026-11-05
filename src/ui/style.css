@@ -1226,8 +1226,10 @@ body {
   overflow: hidden;
 }
 .loader > span { display: block; flex: 0 0 auto; }
-/* 等待态里的点只有几像素，行内看不清；只做视觉放大，盒子仍是 32×16、不占额外行高 */
+/* 等待态里的点只有几像素，行内看不清；只做视觉放大，盒子仍是 32×16、不占额外行高。
+   在线款的盒子已经是缩好的真实尺寸，再乘 1.25 会把字裁出盒子。 */
 .thinking .loader { transform: scale(1.25); }
+.thinking .loader[data-kind='uv'] { transform: none; }
 
 /* ① 墨点呼吸（默认）：三点依次明暗，只动 opacity 与 scale */
 .loader[data-kind='dots'] > span {
