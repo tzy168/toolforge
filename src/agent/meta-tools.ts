@@ -418,8 +418,9 @@ async function createTool(args: Json, ctx: MetaContext): Promise<string> {
 
   // 4) 跑自带用例。必须在依赖就位之后——否则 require 一上来就失败，
   //    那种失败骗人，会让人以为代码写错了
+  // 用例必须在 untested 状态下跑，所以这里显式开口；模型侧的 runTool 不给这个权限
   const runner = async (t: Tool, a: Json): Promise<unknown> => {
-    const r = await executeTool(t, a, { sessionId: ctx.sessionId, runner: ctx.runTool });
+    const r = await executeTool(t, a, { sessionId: ctx.sessionId, runner: ctx.runTool, allowUntested: true });
     if (!r.ok) throw new Error(r.error);
     return r.result;
   };

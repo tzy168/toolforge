@@ -13,32 +13,46 @@ const fsNative = require('node:fs') as typeof import('node:fs');
 const httpsNative = require('node:https') as typeof import('node:https');
 const httpNative = require('node:http') as typeof import('node:http');
 
-const NET_MODULES = new Set([
-  'http',
-  'https',
-  'net',
-  'tls',
-  'dgram',
-  'http2',
-  'undici',
-  'node:http',
-  'node:https',
-  'node:net',
-  'node:tls',
-  'node:dgram',
-  'node:http2',
-  'node:undici',
+/**
+ * 内建模块白名单：只放行「纯计算、不碰文件 / 网络 / 进程」的那一小撮根基。
+ *
+ * 原来是列黑名单——http、fs、child_process 逐个枚举，漏一个就是一道口子：实测
+ * require('node:fs') 能绕过 guardFs，require('module') 还能把 Module._load 改回来。
+ * 改成白名单后，没列进来的内建模块一律拒绝；非内建（相对路径、三方依赖）仍交给
+ * 原始加载器，工具声明的依赖照常 require。
+ *
+ * 代价：三方依赖若在初始化时 require('fs') 之类，会被拒。这是刻意的安全取舍——
+ * 运行时降级到无 OS 权限开关时，这层是唯一的文件防线；宁可让这类依赖跑不起来。
+ */
+const ALLOW_BUILTIN_ROOTS = new Set([
+  'assert', 'buffer', 'constants', 'crypto', 'events', 'path', 'punycode',
+  'querystring', 'stream', 'string_decoder', 'timers', 'url', 'util', 'zlib',
+  'async_hooks', 'diagnostics_channel', 'perf_hooks',
 ]);
-const HARD_BLOCK = new Set([
-  'child_process',
-  'node:child_process',
-  'cluster',
-  'node:cluster',
-  'worker_threads',
-  'node:worker_threads',
-  'inspector',
-  'node:inspector',
-]);
+
+/** Node 20.10+ 有 isBuiltin；老版本用 builtinModules 兜底 */
+const isBuiltinRequest = (id: string): boolean => {
+  if (id.startsWith('node:')) return true;
+  if (typeof Module.isBuiltin === 'function') return Boolean(Module.isBuiltin(id));
+  const roots: string[] = (Module.builtinModules || []).map((n: string) =>
+    String(n).replace(/^node:/, '').split('/')[0]
+  );
+  return roots.includes(id.split('/')[0]);
+};
+
+const HINT: Record<string, string> = {
+  fs: '文件请走 ctx.fs',
+  http: '网络请走 ctx.net',
+  https: '网络请走 ctx.net',
+  net: '网络请走 ctx.net',
+  tls: '网络请走 ctx.net',
+  dgram: '网络请走 ctx.net',
+  http2: '网络请走 ctx.net',
+  module: '不允许改写模块加载器',
+  vm: '不允许在沙箱内再开执行上下文',
+  child_process: '不允许拉起子进程',
+  process: '不允许直接加载 process 模块',
+};
 
 interface Payload {
   input?: Record<string, unknown>;
@@ -230,17 +244,69 @@ async function run(): Promise<unknown> {
   };
 
   // 收网：此后工具代码再也 require 不到原生网络与子进程
-  const origLoad = Module._load;
-  Module._load = function patched(request: string, parent: unknown, isMain: boolean) {
-    const id = String(request);
-    if (NET_MODULES.has(id)) {
-      throw new Error(`安全策略：禁止直接加载 ${id}，网络请用 ctx.net`);
+  //
+  // 但 require 不是唯一入口。全局 fetch / WebSocket / XMLHttpRequest 不经过 Module._load，
+  // process.getBuiltinModule('http') 也能直接取到原生网络模块——一个零 net 声明、判 L1
+  // 自动放行的 script 工具用它们就能把数据发出去，而 Node 的 --permission 不约束网络。
+  // 所以加载工具入口之前先把这几个入口收掉；ctx.net 用的是上面已缓存的 httpNative /
+  // httpsNative，不受影响。
+  //
+  // 内建模块的封堵见下面的白名单。这仍不是形式化边界：工具把全局写回来、或借已
+  // 放行模块做侧信道，都不在这里保证。三方库若在初始化时依赖全局 fetch 或被禁的
+  // 内建模块（如 fs），会在这一步之后报错，属于已知的兼容性代价。
+  const stripGlobal = (key: string): void => {
+    try {
+      Object.defineProperty(globalThis, key, { value: undefined, configurable: true, writable: true });
+    } catch {
+      // 极少数运行时不允许重定义全局，退化成直接赋值
+      try {
+        (globalThis as unknown as Record<string, unknown>)[key] = undefined;
+      } catch {
+        /* 忽略 */
+      }
     }
-    if (HARD_BLOCK.has(id)) {
-      throw new Error(`安全策略：禁止加载 ${id}`);
+  };
+  for (const key of ['fetch', 'WebSocket', 'XMLHttpRequest', 'EventSource']) stripGlobal(key);
+  try {
+    Object.defineProperty(process, 'getBuiltinModule', { value: undefined, configurable: true, writable: true });
+  } catch {
+    /* 老运行时没有这个 API，本来就不存在这条路径 */
+  }
+
+  const origLoad = Module._load;
+  const patchedLoad = function (this: unknown, request: string, parent: unknown, isMain: boolean) {
+    const id = String(request);
+    if (isBuiltinRequest(id)) {
+      const root = id.replace(/^node:/, '').split('/')[0];
+      if (!ALLOW_BUILTIN_ROOTS.has(root)) {
+        const hint = HINT[root] ? `（${HINT[root]}）` : '';
+        throw new Error(`安全策略：禁止加载内建模块 ${id}${hint}；工具只能 require 已放行的纯计算内建模块与三方依赖`);
+      }
     }
     return origLoad.call(this, request, parent, isMain);
   };
+  // 工具模块作用域里的 module.constructor 就是 Module 类；不冻结的话，改一行
+  // module.constructor._load = ... 就能把上面的检查整个摘掉。
+  try {
+    Object.defineProperty(Module, '_load', { value: patchedLoad, writable: false, configurable: false });
+  } catch {
+    Module._load = patchedLoad; // 极少数运行时不允许重定义，退化为可写赋值
+  }
+
+  // process 上还留着几条不走 Module._load 的捷径，一并收掉。
+  const stripProcess = (key: string): void => {
+    try {
+      Object.defineProperty(process, key, { value: undefined, configurable: true, writable: true });
+    } catch {
+      /* 运行时没有或不许改这个属性，忽略 */
+    }
+  };
+  for (const key of ['binding', 'dlopen', '_linkedBinding']) stripProcess(key);
+  try {
+    Object.defineProperty(process, 'mainModule', { value: null, configurable: true, writable: true });
+  } catch {
+    /* 忽略 */
+  }
 
   if (!req.entry) throw new Error('缺少入口文件');
   const mod = origLoad.call(Module, path.resolve(req.entry), null, false);

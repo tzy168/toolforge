@@ -137,8 +137,24 @@ export async function runExamples(tool: Tool, runner: (tool: Tool, args: Record<
       let passed = true;
       let note = '';
       if (ex.expect) {
-        const ctx = vm.createContext({ result: out });
-        passed = Boolean(vm.runInContext(`Boolean(${ex.expect})`, ctx, { timeout: 1000 }));
+        // 与 transform 同理：断言在隔离 realm 里求值，不把宿主对象传进去。
+        // expect 由模型提供，本就是一段待求值代码，所以更要禁掉 realm 内的代码生成，
+        // 免得 result.constructor.constructor 之类把「断言」变成宿主代码执行的入口。
+        let serialized = 'null';
+        try {
+          serialized = JSON.stringify(out ?? null) ?? 'null';
+        } catch {
+          /* 结果不可序列化时按 null 求值，断言自然不成立 */
+        }
+        const ctx = vm.createContext(
+          { __result: serialized },
+          { codeGeneration: { strings: false, wasm: false } }
+        );
+        passed = Boolean(
+          vm.runInContext(`(function(result){ return Boolean(${ex.expect}); })(JSON.parse(__result))`, ctx, {
+            timeout: 1000,
+          })
+        );
         if (!passed) note = `断言不成立：${ex.expect}`;
       }
       results.push({

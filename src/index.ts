@@ -575,9 +575,29 @@ export class ToolForge {
     audit.append({ type: 'chat_stop', by: 'human' });
   }
 
+  /**
+   * 人工放行。这是「把一件只在本会话可用的工具变成常驻」的动作，得先确认它真的
+   * 等在这里待人审、用例确实跑过、静态扫描没有高危命中，不能只凭一个 id 就改状态。
+   *
+   * 导入的工具包在导入时刻意不执行工具代码，因此没有本地用例记录；这类工具允许人工
+   * 放行，但审计里标出 noTests，事后能分清「审过用例」与「人工担责」。
+   */
   approve(id: string): ForgeState {
+    const tool = store.get(id);
+    if (!tool) throw new Error(`工具不存在：${id}`);
+    if (tool.status !== 'pending') {
+      throw new Error(`只能放行待审核的工具：${id} 当前状态为 ${tool.status}（用例未过请先重造并跑通用例）`);
+    }
+    const review = tool.meta?.review;
+    if ((review?.findings || []).some((f) => f.level === 'high')) {
+      throw new Error(`工具 ${id} 的静态扫描命中高危，不能放行`);
+    }
+    const tests = review?.tests || [];
+    if (tests.length && !tests.every((t) => t.ok)) {
+      throw new Error(`工具 ${id} 的自带用例未全部通过，不能放行`);
+    }
     store.patch(id, { status: 'active', sessionId: null });
-    audit.append({ type: 'approve', tool: id, by: 'human' });
+    audit.append({ type: 'approve', tool: id, by: 'human', noTests: tests.length === 0 });
     return this.state();
   }
 
@@ -651,8 +671,8 @@ export class ToolForge {
     return this.importPack(readPackFile(file));
   }
 
-  importPack(pack: unknown, opts?: { approve?: boolean }): ImportResult[] {
-    const results = importPack(pack, opts);
+  importPack(pack: unknown): ImportResult[] {
+    const results = importPack(pack);
     audit.append({
       type: 'import_pack',
       name: (pack as Pack | null)?.name,

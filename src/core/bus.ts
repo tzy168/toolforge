@@ -59,7 +59,7 @@ export function clampForModel(value: unknown): string {
  * 任何 tool 都走这里，没有旁门。
  */
 export async function executeTool(tool: Tool, args: Json = {}, opts: ExecuteOptions = {}): Promise<ToolResult> {
-  const { sessionId = null, depth = 0, runner = null } = opts;
+  const { sessionId = null, depth = 0, runner = null, allowUntested = false } = opts;
   const started = Date.now();
   let ok = false;
   let result: unknown;
@@ -68,7 +68,7 @@ export async function executeTool(tool: Tool, args: Json = {}, opts: ExecuteOpti
   try {
     if (depth > 5) throw new Error('工具组合层数过深（最多 5 层）');
 
-    const usable = isUsable(tool, sessionId);
+    const usable = isUsable(tool, sessionId, { allowUntested });
     if (!usable) {
       throw new Error(`工具 ${tool.name} 尚未放行（当前状态 ${tool.status}），只有创建它的那次会话能临时调用`);
     }

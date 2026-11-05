@@ -673,3 +673,243 @@ test('工作目录：写 @workspace 判 L2 转人工，只读判 L1 自动放行
     '定级理由要写明会改动用户项目'
   );
 });
+
+test('脚本沙箱：零权限工具拿不到全局网络入口，也拿不到绕过 Module._load 的内建入口', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+
+  // 不真的联网，只看能力面的形状：这些入口在工具代码里应当一律是 undefined。
+  // 改坏 runtime-child 的 stripGlobal / getBuiltinModule 封堵，这条断言必须变红。
+  const r = await tf.runTool('create_tool', {
+    name: 'net_surface_probe',
+    description: '回归：未声明网络权限的脚本不应拿到全局 fetch 或 process.getBuiltinModule。',
+    kind: 'script',
+    input: { type: 'object', properties: {} },
+    code: `module.exports = async () => ({
+  fetchType: typeof fetch,
+  wsType: typeof WebSocket,
+  xhrType: typeof XMLHttpRequest,
+  builtinType: typeof process.getBuiltinModule,
+});`,
+    permissions: {},
+    examples: [
+      {
+        name: '全局网络入口已收走',
+        args: {},
+        expect:
+          "result.fetchType === 'undefined' && result.wsType === 'undefined' && " +
+          "result.xhrType === 'undefined' && result.builtinType === 'undefined'",
+      },
+    ],
+  });
+  const out = r.ok ? JSON.parse(String(r.result)) : {};
+  assert.equal(out.ok, true, JSON.stringify(out.tests?.details?.[0]?.note || out));
+  assert.equal(out.tool?.status, 'active', '零权限工具仍应自动放行，只是能力面被收走');
+
+  // 放行之后也要一致：不能只在「跑用例」那一瞬被约束
+  const again = await tf.runTool('net_surface_probe', {});
+  assert.equal(again.ok, true, again.error);
+  const shape = again.result as { fetchType: string; wsType: string; xhrType: string; builtinType: string };
+  assert.equal(shape.fetchType, 'undefined');
+  assert.equal(shape.wsType, 'undefined');
+  assert.equal(shape.xhrType, 'undefined');
+  assert.equal(shape.builtinType, 'undefined');
+});
+
+test('模块白名单：危险内建被拒、纯计算内建可用，且 Module._load 改不回去', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  const r = await tf.runTool('create_tool', {
+    name: 'module_surface_probe',
+    description: '回归：脚本沙箱只放行纯计算内建模块，危险内建与进程捷径一律拒绝。',
+    kind: 'script',
+    input: { type: 'object', properties: {} },
+    code: `module.exports = async () => {
+  const probe = (id) => { try { require(id); return false; } catch (e) { return true; } };
+  return {
+    fsBlocked: probe('node:fs'),
+    httpBlocked: probe('http'),
+    moduleBlocked: probe('module'),
+    vmBlocked: probe('vm'),
+    pathOk: (() => { try { return typeof require('path').resolve === 'function'; } catch (e) { return false; } })(),
+    loadFrozen: (() => {
+      try { const d = Object.getOwnPropertyDescriptor(module.constructor, '_load'); return Boolean(d && d.writable === false && d.configurable === false); }
+      catch (e) { return false; }
+    })(),
+    bindingGone: typeof process.binding === 'undefined',
+    mainModuleGone: process.mainModule === null,
+  };
+};`,
+    permissions: {},
+    examples: [
+      {
+        name: '白名单一一生效',
+        args: {},
+        expect:
+          'result.fsBlocked === true && result.httpBlocked === true && result.moduleBlocked === true && ' +
+          'result.vmBlocked === true && result.pathOk === true && result.loadFrozen === true && ' +
+          'result.bindingGone === true && result.mainModuleGone === true',
+      },
+    ],
+  });
+  const out = r.ok ? JSON.parse(String(r.result)) : {};
+  assert.equal(out.ok, true, JSON.stringify(out.tests?.details?.[0]?.note || out));
+  assert.equal(out.tool?.status, 'active');
+});
+
+test('transform 的 vm 拿不到宿主 realm，逃逸型断言也不该被当成通过', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  const r = await tf.runTool('create_tool', {
+    name: 'vm_escape_probe',
+    description: '回归：纯计算工具不能通过构造器链拿回宿主的 process 对象。',
+    kind: 'transform',
+    input: { type: 'object', properties: {} },
+    code: `var escaped = false;
+try { var p = input.constructor.constructor('return process')(); escaped = Boolean(p && p.versions); } catch (e) { escaped = false; }
+return { escaped: escaped, ok: true };`,
+    permissions: {},
+    examples: [{ name: '逃逸失败', args: {}, expect: 'result.escaped === false && result.ok === true' }],
+  });
+  const out = r.ok ? JSON.parse(String(r.result)) : {};
+  assert.equal(out.ok, true, JSON.stringify(out.tests?.details?.[0]?.note || out));
+  const call = await tf.runTool('vm_escape_probe', {});
+  assert.equal((call.result as { escaped: boolean }).escaped, false);
+
+  // 断言表达式本身在旧实现里也能借宿主对象执行任意代码，必须直接失败
+  const { runExamples } = await import('../src/core/review.js');
+  const report = await runExamples(
+    { examples: [{ name: '逃逸断言', args: {}, expect: "Boolean(result.constructor.constructor('return process')())" }] } as never,
+    async () => ({ ok: true })
+  );
+  assert.equal(report.ok, false, '逃逸型断言不应被当成通过的用例');
+});
+
+test('用例未过的工具在模型侧调不动，但用例阶段确实执行了', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  const r = await tf.runTool('create_tool', {
+    name: 'untested_gate_probe',
+    description: '回归：自带用例没过的工具不能靠会话豁免被调用。',
+    kind: 'transform',
+    input: { type: 'object', properties: {} },
+    code: 'return 1;',
+    permissions: {},
+    examples: [{ args: {}, expect: 'result === 2' }],
+  });
+  const out = r.ok ? JSON.parse(String(r.result)) : {};
+  assert.equal(out.ok, false);
+  assert.equal(out.tool?.status, 'untested');
+  assert.match(out.tests?.details?.[0]?.note || '', /断言不成立/, '用例应当真的跑过，而不是被闸门拦在门外');
+  const call = await tf.runTool('untested_gate_probe', {});
+  assert.equal(call.ok, false, '模型侧不应能调用 untested 工具');
+  assert.match(call.error || '', /尚未放行/);
+  assert.ok(!tf.allTools().some((t) => t.name === 'untested_gate_probe'), '也不该注入给模型');
+});
+
+test('人工放行与工具包导入：状态、用例、schema 与等级都要重新验过', async () => {
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+
+  const bad = await tf.runTool('create_tool', {
+    name: 'approve_bad_probe',
+    description: '回归：用例没过的工具不该被人工放行。',
+    kind: 'transform',
+    input: { type: 'object', properties: {} },
+    code: 'return 1;',
+    permissions: {},
+    examples: [{ args: {}, expect: 'result === 2' }],
+  });
+  const badOut = JSON.parse(String(bad.result));
+  assert.throws(() => tf.approve(badOut.tool.id), /只能放行待审核/);
+  assert.throws(() => tf.approve('no_such_id'), /工具不存在/);
+
+  const pending = await tf.runTool('create_tool', {
+    name: 'approve_ok_probe',
+    description: '回归：用例通过且待审核的工具可以人工放行。',
+    kind: 'script',
+    input: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+    code: `module.exports = async (i, ctx) => ({ ok: ctx.fs.write('notes/a.txt', i.text).length > 0 });`,
+    permissions: { fsWrite: ['notes'] },
+    examples: [{ args: { text: 'x' }, expect: 'result.ok === true' }],
+  });
+  const pOut = JSON.parse(String(pending.result));
+  assert.equal(pOut.tool.status, 'pending');
+  assert.equal(tf.approve(pOut.tool.id).tools.find((t: { id: string }) => t.id === pOut.tool.id)?.status, 'active');
+
+  const { importPack } = await import('../src/core/pack.js');
+  assert.throws(() => importPack({ schema: 'evil/1', tools: [] }), /不是 toolforge.pack\/1/);
+  const pack = {
+    schema: 'toolforge.pack/1',
+    name: 'p',
+    version: '1.0.0',
+    description: '',
+    createdAt: '',
+    tools: [
+      {
+        name: 'imported_probe',
+        version: '1.0.0',
+        description: '导入探针：声明可执行外部命令，验证等级按本机能力重算。',
+        kind: 'shell',
+        impl: { command: 'echo', args: [] },
+        permissions: { exec: true },
+        examples: [{ args: {} }],
+        status: 'active',
+        trust: 'L0',
+        sessionId: null,
+      },
+    ],
+  };
+  const imported = importPack(pack);
+  assert.equal(imported[0]?.ok, true, JSON.stringify(imported));
+  const saved = tf.state().tools.find((t) => t.name === 'imported_probe');
+  assert.equal(saved?.status, 'pending', '包里伪造的 active 不采信');
+  assert.equal(saved?.trust, 'L3', '包里伪造的 L0 必须按本机能力重算为 L3');
+});
+
+test('http 逐跳校验重定向：同主机可跟随，跨主机被域名白名单拦下', async () => {
+  const { createServer } = await import('node:http');
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  let port = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/start') {
+      res.writeHead(302, { location: '/final' });
+      res.end();
+      return;
+    }
+    if (req.url === '/cross') {
+      res.writeHead(302, { location: `http://localhost:${port}/final` });
+      res.end();
+      return;
+    }
+    res.end('REACHED');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  port = (server.address() as { port: number }).port;
+
+  const mk = (name: string, path: string): void => {
+    store.save({
+      name,
+      description: '验证重定向逐跳校验的 HTTP 工具，仅允许本机域名。',
+      kind: 'http',
+      impl: { method: 'GET', url: `http://127.0.0.1:${port}${path}`, timeoutMs: 5000 },
+      permissions: { net: ['127.0.0.1'] },
+      examples: [{ args: {} }],
+      status: 'active',
+    });
+  };
+  mk('redirect_same_host', '/start');
+  mk('redirect_cross_host', '/cross');
+
+  try {
+    const same = await tf.runTool('redirect_same_host', {});
+    assert.equal(same.ok, true, same.error);
+    assert.equal(same.result, 'REACHED', '同主机重定向应能跟随到最终响应');
+    const cross = await tf.runTool('redirect_cross_host', {});
+    assert.equal(cross.ok, false, '跨主机重定向必须被拒');
+    assert.match(cross.error || '', /权限拒绝/);
+  } finally {
+    server.close();
+  }
+});

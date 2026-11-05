@@ -27,10 +27,21 @@ export interface BrokenTool {
 
 /**
  * 「这件工具此刻能不能用」的唯一判定：已放行，或属于创建它的那次会话。
- * 仓库过滤（usable）与执行闸门（executeTool）都走这里——两处各写一遍迟早在改规则时漏掉一边。
+ *
+ * 会话豁免不等于「任何状态都放行」：用例没过的 untested、被拒的 rejected、被停用的
+ * disabled 一律不可调用，否则「用例门槛」形同虚设（实测 untested 工具曾在创建会话内
+ * 照常返回结果）。用例阶段确实需要执行 untested 工具，由 create_tool 的 runner 显式
+ * 传 allowUntested 开这道口子。
  */
-export function isUsable(tool: Tool, sessionId: string | null): boolean {
-  return tool.status === 'active' || (tool.sessionId !== null && tool.sessionId === sessionId);
+export function isUsable(
+  tool: Tool,
+  sessionId: string | null,
+  opts: { allowUntested?: boolean } = {}
+): boolean {
+  if (tool.status === 'active') return true;
+  const sameSession = tool.sessionId !== null && tool.sessionId === sessionId;
+  if (opts.allowUntested === true && sameSession && tool.status === 'untested') return true;
+  return sameSession && tool.status === 'pending';
 }
 
 export class ToolStore {

@@ -173,6 +173,8 @@ export interface ExecuteOptions {
   sessionId?: string | null;
   depth?: number;
   runner?: ((name: string, args: Json, depth?: number) => Promise<ToolResult>) | null;
+  /** 仅供 create_tool 跑自带用例时开口：用例要在 untested 状态下执行，模型侧不能调 */
+  allowUntested?: boolean;
 }
 
 export interface AgentEvent {
