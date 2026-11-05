@@ -63,6 +63,10 @@ export function selectTools(all: Tool[], query: string, options: SelectOptions =
     picked.push(t);
     seen.add(t.name);
   }
+  // 输出按名字定序：tools 数组的序列化属于缓存前缀的一部分，顺序一变整段前缀就废了。
+  // 评分里带 lastRun 提权（工具跑一次分数就变），照评分顺序输出会让同一轮里
+  // 每一步的工具数组都不一样——那等于每步都全量 miss。选哪几件由分数决定，怎么排不该由它决定。
+  picked.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return picked;
 }
 

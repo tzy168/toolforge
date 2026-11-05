@@ -65,6 +65,40 @@ export interface ChatResult {
   sessionId: string;
   /** true 表示用户主动暂停，不是出错 */
   aborted?: boolean;
+  /** 本轮累计的 token 用量与缓存命中，CLI / 界面用它显示命中率 */
+  usage?: { prompt: number; hit: number; miss: number; completion: number };
+}
+
+/**
+ * 历史保留多少字符（一问一答合计）。
+ *
+ * 缓存是「从第 0 个 token 起逐字节相同」才算命中，所以历史只要还在预算内就整段留着——
+ * 每轮追加一点点，前缀就一直是上一轮的延长线，历史部分全命中。
+ * 原来固定 `slice(-8)`：从第 5 轮起窗口每轮整体前移一格，前缀当场对不上，
+ * 8 条历史每轮重新 prefill 一遍。
+ */
+const HISTORY_CHAR_BUDGET = 20000;
+
+/**
+ * 只裁「真放不下」的那部分。
+ *
+ * 从后往前累计，超出预算就停；落点再往前挪到最近的一条 user，
+ * 别让模型看到「只有答句、没有问句」的半轮。
+ */
+export function trimHistory(history: ChatMessage[]): ChatMessage[] {
+  const rows = history.filter(
+    (m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'
+  );
+  let used = 0;
+  let start = rows.length;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const cost = String(rows[i].content).length;
+    if (used + cost > HISTORY_CHAR_BUDGET) break;
+    used += cost;
+    start = i;
+  }
+  while (start < rows.length && rows[start].role !== 'user') start += 1;
+  return rows.slice(start);
 }
 
 /**
@@ -447,21 +481,38 @@ export class ToolForge {
     this._abort = new AbortController();
     const messages: ChatMessage[] = [
       ...buildSystemMessages(phase, this.allTools(), getWorkspace()),
-      ...history
-        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-        .slice(-8),
+      ...trimHistory(history),
       { role: 'user', content: input },
     ];
 
-    const toolProvider = (msgs: ChatMessage[]): ToolBundle[] => {
-      const query = msgs
+    // 本轮的工具集合一轮只算一次。
+    //
+    // DeepSeek 的缓存是「从第 0 个 token 起的逐字节前缀」，tools 数组也在前缀里。
+    // 原来每步都重新 selectTools：一件工具跑完 store.recordRun 会写 lastRun，
+    // 召回分里带着 lastRun 提权，于是下一步的工具集合/顺序就和上一步不一样——
+    // 一步几十 token 全量 miss，整个上下文白 prefill。
+    // 现在只在「工具清单真变了」（刚造了新工具/刚放行）时重算，造完照样当场能用。
+    let frozen: { sig: string; bundles: ToolBundle[] } | null = null;
+    const toolProvider = (): ToolBundle[] => {
+      const all = this.allTools();
+      // 指纹带版本：同名工具被重建（schema 变了）必须重算，否则这一轮会拿旧 schema 去校验
+      const sig = all
+        .map((t) => `${t.name}@${t.version}`)
+        .sort()
+        .join('\n');
+      if (frozen && frozen.sig === sig) return frozen.bundles;
+
+      const query = messages
         .filter((m) => m.role === 'user')
         .map((m) => String(m.content ?? ''))
         .join(' ');
-      const picked = selectTools(this.allTools(), query, { limit: 14, always: META_TOOL_NAMES });
-      return picked.map((t) => ({ openai: toOpenAITool(t) as ToolBundle['openai'], tool: t }));
+      const picked = selectTools(all, query, { limit: 14, always: META_TOOL_NAMES });
+      frozen = { sig, bundles: picked.map((t) => ({ openai: toOpenAITool(t) as ToolBundle['openai'], tool: t })) };
+      return frozen.bundles;
     };
 
+    // 累计本轮的用量：界面据此显示缓存命中率，否则「命中低」只能靠感觉
+    const usage = { prompt: 0, hit: 0, miss: 0, completion: 0 };
     const result = await runLoop({
       client: this.client,
       model: this.model,
@@ -469,6 +520,12 @@ export class ToolForge {
       toolProvider,
       runTool: (n, a) => this.runTool(n, a, 0),
       onEvent: this.onEvent,
+      onUsage: (u) => {
+        usage.prompt += u.prompt;
+        usage.hit += u.hit;
+        usage.miss += u.miss;
+        usage.completion += u.completion;
+      },
       maxSteps: resolveMaxSteps(this.settings),
       signal: this._abort.signal,
     });
@@ -479,6 +536,7 @@ export class ToolForge {
       ok: result.ok,
       sessionId: this.sessionId,
       aborted: result.aborted,
+      usage,
     };
   }
 

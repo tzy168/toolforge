@@ -29,6 +29,19 @@ export interface ToolBundle {
   tool: { name: string };
 }
 
+/**
+ * 一次请求的 token 用量。
+ *
+ * hit / miss 是 DeepSeek 的缓存命中情况：命中部分按低价计费，也是判断「前缀有没有被
+ * 我们自己打散」的唯一凭据——没有它，命中率只能靠感觉。
+ */
+export interface LlmUsage {
+  prompt: number;
+  hit: number;
+  miss: number;
+  completion: number;
+}
+
 export interface LoopOptions {
   client: OpenAI;
   model: string;
@@ -36,6 +49,8 @@ export interface LoopOptions {
   toolProvider: (messages: ChatMessage[]) => Promise<ToolBundle[]> | ToolBundle[];
   runTool: (name: string, args: Json) => Promise<ToolResult>;
   onEvent?: (event: AgentEvent) => void;
+  /** 每次请求结束回报一次用量，用来算缓存命中率 */
+  onUsage?: (usage: LlmUsage) => void;
   maxSteps?: number;
   /** 中止信号。abort 后当前请求立即断掉，循环在下一步前收尾 */
   signal?: AbortSignal;
@@ -61,6 +76,7 @@ async function streamOnce({
   tools,
   onDelta,
   onReasoning,
+  onUsage,
   signal,
 }: {
   client: OpenAI;
@@ -69,6 +85,8 @@ async function streamOnce({
   tools: never[];
   onDelta: (text: string) => void;
   onReasoning?: (text: string) => void;
+  /** 本次请求的量。没回报就回调空值，别让上层把「没数据」当成「零命中」 */
+  onUsage?: (usage: LlmUsage) => void;
   signal?: AbortSignal;
 }): Promise<ChatMessage> {
   const stream = await client.chat.completions.create(
@@ -78,6 +96,9 @@ async function streamOnce({
       tools: tools.length ? tools : undefined,
       tool_choice: tools.length ? ('auto' as never) : undefined,
       stream: true,
+      // 不带 include_usage 时，部分服务商不会在流里回报用量，
+      // 缓存命中率就只能靠猜。DeepSeek/Kimi 都认这个标准字段。
+      stream_options: { include_usage: true },
       // 不传 temperature：推理类模型（如 Kimi k3.1-pro）只接受 1，传 0.2 会被 400 拒绝；
       // 不传则各服务商用自家默认值，兼容性最好。
     },
@@ -87,8 +108,23 @@ async function streamOnce({
   let content = '';
   // index → 累积的工具调用碎片，流结束后按 index 顺序还原
   const calls = new Map<number, { id: string; name: string; args: string }>();
+  let usage: LlmUsage | null = null;
 
   for await (const chunk of stream) {
+    // usage 只在最后一帧（通常是 choices 为空的那帧）出现，且各服务商字段名不一：
+    // OpenAI 兼容网关给 prompt_tokens_details.cached_tokens，DeepSeek 给 prompt_cache_hit_tokens。
+    const u = (chunk as { usage?: Record<string, any> }).usage;
+    if (u) {
+      const hit = Number(u.prompt_cache_hit_tokens ?? u.prompt_tokens_details?.cached_tokens ?? 0) || 0;
+      const prompt = Number(u.prompt_tokens ?? 0) || 0;
+      usage = {
+        prompt,
+        hit,
+        miss: Number(u.prompt_cache_miss_tokens ?? Math.max(prompt - hit, 0)) || 0,
+        completion: Number(u.completion_tokens ?? 0) || 0,
+      };
+    }
+
     const delta = chunk.choices?.[0]?.delta as
       | {
           content?: string | null;
@@ -128,6 +164,8 @@ async function streamOnce({
       function: { name: c.name, arguments: c.args || '{}' },
     }));
 
+  if (usage) onUsage?.(usage);
+
   return {
     role: 'assistant',
     content: content || null,
@@ -142,6 +180,7 @@ export async function runLoop({
   toolProvider,
   runTool,
   onEvent = () => {},
+  onUsage,
   // 与 index.ts 的 DEFAULT_MAX_STEPS 对齐：调用方不传时也别退回到一个更小的值
   maxSteps = 120,
   signal,
@@ -167,6 +206,7 @@ export async function runLoop({
         tools: openaiTools as never[],
         onDelta: (text) => onEvent({ type: 'delta', delta: text }),
         onReasoning: (text) => onEvent({ type: 'reasoning', reasoning: text }),
+        onUsage,
         signal,
       });
     } catch (err) {

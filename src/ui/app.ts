@@ -87,7 +87,9 @@ interface Bridge {
     phase: string;
     history: Array<{ role: string; content: string }>;
     workspace?: string | null;
-  }) => Promise<Envelope<{ reply: string; aborted?: boolean }>>;
+  }) => Promise<
+    Envelope<{ reply: string; aborted?: boolean; usage?: { prompt: number; hit: number; miss: number; completion: number } }>
+  >;
   /** 暂停当前这一轮 */
   stop: () => Promise<Envelope<unknown>>;
   approve: (id: string) => Promise<Envelope<unknown>>;
@@ -262,6 +264,13 @@ interface Task {
 const TASK_KEY = 'toolforge.tasks';
 /** 侧栏分组折叠状态按工作区记住，键是工作区标识 */
 const GROUP_KEY = 'toolforge.groups';
+/**
+ * 一个任务本地留多少字符的对话历史。
+ *
+ * 只用来兜住 localStorage 的体积，不参与「缓存命中」——真发给模型前，后端会按
+ * 自己的预算再裁一遍。所以这里给得比后端宽，别在这儿先把能命中的前缀削掉。
+ */
+const HISTORY_CHARS = 60000;
 
 function taskWorkspace(t: Task): TaskWorkspace {
   return t.workspace ?? null;
@@ -1684,6 +1693,20 @@ function clearWatchdog(): void {
 }
 
 /**
+ * 把一问一答记进任务历史。
+ *
+ * 不再固定 `slice(-8)`：DeepSeek 的缓存按「从第 0 个 token 起的逐字节前缀」命中，
+ * 历史窗口每轮整体前移一格就等于每轮全量重算。后端会按字符预算裁，
+ * 这里只管别把 localStorage 撑爆——超了就从最老的那轮开始整轮丢。
+ */
+function recordTurn(task: Task, user: string, assistant: string): void {
+  task.history.push({ role: 'user', content: user }, { role: 'assistant', content: assistant });
+  while (task.history.length > 2 && JSON.stringify(task.history).length > HISTORY_CHARS) {
+    task.history.splice(0, 2);
+  }
+}
+
+/**
  * 强制收尾：不管请求那边还在不在，先把界面解锁。
  * 和 send() 的正常收尾共用同一套清理，避免两边各写一份、日后改漏。
  */
@@ -1695,11 +1718,7 @@ function forceFinish(taskId: string, message: string): void {
       .map((s) => s.text)
       .join('')
       .trim();
-    task.history.push(
-      { role: 'user', content: liveRun.pendingInput },
-      { role: 'assistant', content: answer || `（${message}）` }
-    );
-    task.history = task.history.slice(-8);
+    recordTurn(task, liveRun.pendingInput, answer || `（${message}）`);
     persistProcess(task, liveRun, answer);
   }
   clearWatchdog();
@@ -1709,6 +1728,29 @@ function forceFinish(taskId: string, message: string): void {
   saveTasks();
   if (activeId === taskId) renderHistory(currentTask());
   scrollBottom();
+}
+
+/**
+ * 顶栏显示上一轮的缓存命中率。
+ *
+ * 命中率是「前缀有没有被自己打散」的唯一直接证据：一改提示词、一换工具集、
+ * 历史一滑动，数字立刻掉下来。没有这个数，优化只能靠猜。
+ */
+function showUsage(usage: { prompt: number; hit: number; miss: number; completion: number } | undefined): void {
+  const node = $<HTMLSpanElement>('#headCache');
+  if (!node) return;
+  if (!usage || !usage.prompt) {
+    node.hidden = true;
+    return;
+  }
+  const pct = Math.round((usage.hit / usage.prompt) * 100);
+  node.hidden = false;
+  node.textContent = `缓存 ${pct}%`;
+  node.title =
+    `上一轮累计：命中 ${usage.hit.toLocaleString()} / 输入 ${usage.prompt.toLocaleString()} tokens\n` +
+    `未命中 ${usage.miss.toLocaleString()}，输出 ${usage.completion.toLocaleString()}\n` +
+    `命中率低通常是前缀变了：改提示词、工具集合变动、或历史窗口滑动。`;
+  node.classList.toggle('low', pct < 50);
 }
 
 async function send(text: string): Promise<void> {
@@ -1770,6 +1812,7 @@ async function send(text: string): Promise<void> {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
       streamed = res.data.reply || '';
       aborted = Boolean(res.data.aborted);
+      showUsage(res.data.usage);
     } else {
       failed = res.error;
     }
@@ -1785,8 +1828,7 @@ async function send(text: string): Promise<void> {
 
   // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失
   const answer = streamed || (aborted ? '（已暂停）' : '');
-  task.history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
-  task.history = task.history.slice(-8);
+  recordTurn(task, text, answer);
   // 整条过程（思考 / 中间正文 / 工具，按真实顺序）一起留在任务上，重开也能按原位看
   persistProcess(task, liveRun, answer);
 

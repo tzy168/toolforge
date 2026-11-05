@@ -365,6 +365,9 @@ body {
 .top-status span { overflow: hidden; text-overflow: ellipsis; }
 #headModel { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); }
 #headModel.unset { color: #9a6b1f; font-weight: var(--fw-medium); }
+/* 缓存命中率：低于一半说明前缀被打散了，用颜色提醒，别让它只是一串数字 */
+#headCache { font-variant-numeric: tabular-nums; cursor: help; }
+#headCache.low { color: #9a6b1f; }
 
 /* ---------- 工作区选择器 ---------- */
 /* 输入框上方那一条：工作区 chip + 下拉菜单 */

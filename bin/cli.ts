@@ -202,8 +202,15 @@ async function repl(): Promise<void> {
       try {
         const res = await tf.chat({ input: text, phase, history });
         history.push({ role: 'user', content: text }, { role: 'assistant', content: res.reply });
-        history = history.slice(-8);
+        // 别用固定窗口裁历史：历史整体前移一格，前缀缓存就整段失效。
+        // 裁到 20000 字以内（后端也按这个量级算预算），能留就全留。
+        while (history.length > 2 && JSON.stringify(history).length > 24000) history.splice(0, 2);
         console.log('\n' + res.reply + '\n');
+        if (res.usage && res.usage.prompt) {
+          const u = res.usage;
+          const pct = Math.round((u.hit / u.prompt) * 100);
+          console.log(`   缓存 ${pct}%  (命中 ${u.hit} / 输入 ${u.prompt} tokens，输出 ${u.completion})`);
+        }
       } catch (err) {
         console.log('\n 出错：' + (err as Error).message + '\n');
       }

@@ -54,6 +54,18 @@ function mockClient(script: any[]): any {
             });
           }
 
+          // 最后一帧照真实服务商的样子：choices 为空，usage 挂在顶层。
+          // msg.usage 可覆盖，用来验证命中率统计。
+          chunks.push({
+            choices: [],
+            usage: msg?.usage ?? {
+              prompt_tokens: 100,
+              prompt_cache_hit_tokens: 80,
+              prompt_cache_miss_tokens: 20,
+              completion_tokens: 7,
+            },
+          });
+
           return (async function* () {
             for (const c of chunks) yield c;
           })();
@@ -162,6 +174,90 @@ test('两级召回：任务词能钓出对的工具', () => {
   ] as any[];
   const picked = selectTools(tools, '帮我查一下 github 上这个仓库的星数', { limit: 1, always: [] });
   assert.equal(picked[0]?.name, 'github_repo_info');
+});
+
+test('召回结果按名字定序：lastRun 提权不能改动 tools 的序列化字节', () => {
+  // 前缀缓存要求 tools 数组逐字节一致。评分里带 lastRun 提权（跑过一次就 +0.5），
+  // 若照评分顺序输出，同一轮里工具一跑完，下一步的 tools 就换了顺序，整段前缀失效。
+  const base = [
+    { name: 'bbb_tool', description: 'b', meta: { tags: [] } },
+    { name: 'aaa_tool', description: 'a', meta: { tags: [] } },
+    { name: 'ccc_tool', description: 'c', meta: { tags: [] } },
+  ] as any[];
+  const cold = selectTools(base, 'x', { limit: 3 }).map((t) => t.name);
+  const warm = selectTools(
+    base.map((t) => ({ ...t, meta: { ...t.meta, lastRun: { ok: true, ms: 1, at: 'now' } } })),
+    'x',
+    { limit: 3 }
+  ).map((t) => t.name);
+  assert.deepEqual(cold, ['aaa_tool', 'bbb_tool', 'ccc_tool']);
+  assert.deepEqual(warm, cold);
+});
+
+test('历史只在超预算时才裁，且从问答边界起算', async () => {
+  const { trimHistory } = await import('../src/index.js');
+  // 短历史一条都不许丢：窗口一滑动，前缀当场对不上，每轮全量重算
+  const short = [
+    { role: 'user' as const, content: 'a' },
+    { role: 'assistant' as const, content: 'b' },
+    { role: 'user' as const, content: 'c' },
+    { role: 'assistant' as const, content: 'd' },
+  ];
+  assert.equal(trimHistory(short).length, 4);
+
+  // 超预算：裁掉最老的，但落点必须是 user——不能留下「只有答句」的半轮
+  const big = 'x'.repeat(9000);
+  const long = [
+    { role: 'user' as const, content: big },
+    { role: 'assistant' as const, content: big },
+    { role: 'user' as const, content: big },
+    { role: 'assistant' as const, content: big },
+  ];
+  const kept = trimHistory(long);
+  assert.ok(kept.length < 4, '超预算应裁掉最老的一轮');
+  assert.equal(kept[0].role, 'user');
+  assert.equal(kept.at(-1)!.content, big);
+});
+
+test('流式：usage 里的命中数被读出来（DeepSeek 与 OpenAI 两种字段名）', async () => {
+  const { runLoop } = await import('../src/agent/loop.js');
+  const seen: Array<{ prompt: number; hit: number; miss: number }> = [];
+  const mk = (usage: Record<string, unknown>) =>
+    ({
+      chat: {
+        completions: {
+          async create() {
+            return (async function* () {
+              yield { choices: [{ delta: { content: '好' } }] };
+              yield { choices: [], usage };
+            })();
+          },
+        },
+      },
+    }) as any;
+
+  await runLoop({
+    client: mk({ prompt_tokens: 100, prompt_cache_hit_tokens: 90, prompt_cache_miss_tokens: 10, completion_tokens: 1 }),
+    model: 'm',
+    messages: [{ role: 'user', content: 'x' }],
+    toolProvider: () => [],
+    runTool: async () => ({ ok: true, result: null, ms: 0 }),
+    onUsage: (u) => seen.push(u),
+  });
+  // OpenAI 兼容网关只给 prompt_tokens_details.cached_tokens，也得认
+  await runLoop({
+    client: mk({ prompt_tokens: 50, prompt_tokens_details: { cached_tokens: 40 }, completion_tokens: 1 }),
+    model: 'm',
+    messages: [{ role: 'user', content: 'x' }],
+    toolProvider: () => [],
+    runTool: async () => ({ ok: true, result: null, ms: 0 }),
+    onUsage: (u) => seen.push(u),
+  });
+
+  assert.deepEqual(seen, [
+    { prompt: 100, hit: 90, miss: 10, completion: 1 },
+    { prompt: 50, hit: 40, miss: 10, completion: 1 },
+  ]);
 });
 
 const { mergeProviders, pickActive } = await import('../src/core/models.js');
