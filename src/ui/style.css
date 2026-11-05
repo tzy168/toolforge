@@ -19,6 +19,10 @@
   /* 正文默认字重比原先重一档（400 → 450 在支持的可变字体上更清晰） */
   --fw-normal: 450;
   --fw-medium: 560;
+
+  /* 对话区宽度：占整个窗口的 60%。对话与输入框都读这一个值，
+     改一处两边一起变，左右边界始终对得上。 */
+  --chat-width: 60vw;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -363,37 +367,64 @@ body {
   white-space: nowrap;
 }
 .top-status span { overflow: hidden; text-overflow: ellipsis; }
-#headModel { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); }
-#headModel.unset { color: #9a6b1f; font-weight: var(--fw-medium); }
 /* 缓存命中率：低于一半说明前缀被打散了，用颜色提醒，别让它只是一串数字 */
 #headCache { font-variant-numeric: tabular-nums; cursor: help; }
 #headCache.low { color: #9a6b1f; }
 
-/* ---------- 工作区选择器 ---------- */
-/* 输入框上方那一条：工作区 chip + 下拉菜单 */
-.composer-wrap { max-width: 720px; margin: 0 auto; width: 100%; padding: 0 20px; }
-.ws-bar { display: flex; align-items: center; gap: 4px; position: relative; padding: 0 0 8px 2px; }
+/* ---------- 输入区 ---------- */
+/* 一颗胶囊：上半输入、下半操作，整体跟着对话区一起加宽 */
+/* 对话区宽度：占整个窗口的 60%，居中。对话与输入框共用这一个值，
+   否则两者会各宽一截、左右边界对不上。 */
+.composer-wrap { max-width: var(--chat-width); margin: 0 auto; width: 100%; padding: 0 28px 22px; }
 
-.ws-chip {
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+/* 聚焦时整个胶囊提亮，而不是只给 textarea 描边——这样「在跟谁说话」很清楚 */
+.composer:focus-within { border-color: #d6d4cc; box-shadow: 0 2px 16px rgba(23, 23, 26, 0.06); }
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 9px 9px;
+}
+
+/* 左侧：工作区。菜单定位以它为锚 */
+.ws-bar { position: relative; display: flex; align-items: center; min-width: 0; }
+.composer-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.model-bar { position: relative; min-width: 0; }
+
+/* 操作栏里的小胶囊：工作区、模型共用一套外观 */
+.cb-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  max-width: 340px;
+  gap: 5px;
+  max-width: 260px;
   font-family: inherit;
   font-size: var(--fs-sm);
+  line-height: 1.3;
   color: var(--muted);
   background: transparent;
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: 999px;
-  padding: 5px 11px;
+  padding: 5px 9px;
   cursor: pointer;
   transition: color 0.14s, border-color 0.14s, background 0.14s;
 }
-.ws-chip:hover { color: var(--ink); border-color: var(--faint); background: #fff; }
+.cb-chip:hover { color: var(--ink); background: var(--panel); border-color: var(--line); }
+.cb-caret { font-size: 9px; opacity: 0.55; flex: 0 0 auto; }
 /* 未选：虚线 + 淡色，提示"这条任务还没定在哪干活" */
-.ws-chip.unset { border-style: dashed; color: var(--faint); }
-.ws-chip.general { color: #9a6b1f; border-color: #e8d6b8; background: #fffdf7; }
-.ws-chip-toggle { padding: 5px 8px; max-width: none; }
+.ws-chip.unset { color: var(--faint); border-color: var(--line); border-style: dashed; }
+.ws-chip.general { color: #9a6b1f; }
 .ws-chip-icon { font-size: 9px; opacity: 0.65; flex: 0 0 auto; }
 .ws-chip-name {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -401,25 +432,31 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 模型名用等宽，切换后一眼能认出换的是哪个 */
+.model-chip { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.model-chip.unset { color: #9a6b1f; }
+.model-chip > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 菜单浮在 chip 下方。用 absolute 而不是 fixed，跟随输入区滚动 */
+/* 菜单浮在胶囊上方。用 absolute，跟随输入区滚动 */
 .ws-menu {
   position: absolute;
-  left: 2px;
-  bottom: calc(100% + 2px);
+  left: 0;
+  bottom: calc(100% + 6px);
   z-index: 30;
   min-width: 280px;
   max-width: 380px;
   padding: 5px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   box-shadow: 0 8px 28px rgba(23, 23, 26, 0.1);
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 .ws-menu[hidden] { display: none; }
+/* 模型菜单贴右边，别在窄窗口里跑出屏幕 */
+.model-menu { left: auto; right: 0; min-width: 260px; max-width: 340px; }
 .ws-option {
   font-family: inherit;
   text-align: left;
@@ -430,6 +467,9 @@ body {
   cursor: pointer;
 }
 .ws-option:hover { background: var(--panel); }
+.ws-option[aria-disabled='true'] { opacity: 0.5; cursor: default; }
+.ws-option[aria-disabled='true']:hover { background: transparent; }
+.ws-option.active { background: #f3f2ee; }
 .ws-opt-name { display: block; font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--ink); }
 .ws-opt-desc { display: block; font-size: var(--fs-xs); color: var(--faint); margin-top: 2px; line-height: 1.5; }
 
@@ -860,7 +900,11 @@ body {
 
 /* ---------- 对话 ---------- */
 .chat { flex: 1; overflow-y: auto; padding: 28px 0 8px; }
-.chat-inner { max-width: 760px; margin: 0 auto; padding: 0 28px; }
+/* 对话区占满整个主区宽度：内容跟着窗口走，不再挤在中间一条窄栏里 */
+/* 对话区占窗口 60% 并居中：正文与输入框共用 --chat-width，两边边界才对得齐。
+   100% 上限是为了窗口很窄时不被撑出横向滚动。 */
+.chat-inner { max-width: var(--chat-width); margin: 0 auto; padding: 0 28px; }
+
 
 .empty { text-align: center; margin-top: 14vh; color: var(--faint); position: relative; }
 /* 极淡的网格纹理：给大片留白一点结构感，不影响读文字 */
@@ -1016,10 +1060,14 @@ body {
   .quick { grid-template-columns: 1fr; }
 }
 
-/* 用户靠右、AI 靠左，各自最宽 80% */
-.turn { margin-bottom: 22px; display: flex; flex-direction: column; max-width: 82%; }
-.turn-user { align-self: flex-end; align-items: flex-end; margin-left: auto; }
-.turn-bot { align-self: flex-start; align-items: flex-start; }
+/* 正文铺满整条内容带。这里不要再写 max-width 百分比：.chat-inner 已经是满宽，
+   任何百分比都会在右侧留下一条和输入框对不齐的死白边（原来 82% 就是这么来的）。
+   注意别给 .turn-bot 加 align-items: flex-start——那会让 .msg-bot 收缩到内容宽度，
+   短句只剩几十像素、表格也撑不满，看着就像"没占满"。
+   AI 那一轮要默认的 stretch 才能撑满；只有用户气泡需要靠右收缩。 */
+.turn { margin-bottom: 22px; display: flex; flex-direction: column; }
+.turn-user { align-items: flex-end; }
+.turn-bot { align-items: stretch; }
 
 /* 用户气泡：实体底色 + 圆角，右上角收一个小口 */
 .msg-user {
@@ -1084,7 +1132,9 @@ body {
   color: var(--muted);
 }
 .md a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
-.md table { border-collapse: collapse; margin: 0 0 12px; font-size: var(--fs-sm); display: block; overflow-x: auto; }
+/* 表格铺满内容宽度：display:block 会让它退化成自适应宽度的块，右侧留白；
+   要横向滚动就交给外层 .md 的 overflow，别拿 table 自己当滚动容器。 */
+.md table { border-collapse: collapse; margin: 0 0 12px; font-size: var(--fs-sm); width: 100%; }
 .md th, .md td { border: 1px solid var(--line); padding: 7px 11px; text-align: left; }
 .md th { background: var(--panel); font-weight: var(--fw-medium); }
 .md hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
@@ -1469,65 +1519,53 @@ body {
 }
 
 /* ---------- 输入 ---------- */
-.composer {
-  padding: 0 0 22px;
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
-  width: 100%;
-}
-
 #input {
-  flex: 1;
   font-family: inherit;
   font-size: var(--fs-lg);
   line-height: 1.6;
-  padding: 10px 13px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: 14px 16px 4px;
+  border: none;
+  border-radius: 18px 18px 0 0;
   resize: none;
-  max-height: 160px;
+  max-height: 176px;
   outline: none;
   color: var(--ink);
-  background: #fff;
+  background: transparent;
   /* 单行时行高取整会让 scrollHeight 比 clientHeight 大 1px，Chromium 就会画滚动条；
      growInput() 只在内容真的超过上限时才改回 auto */
   overflow-y: hidden;
 }
-#input:focus { border-color: var(--faint); }
+/* 描边交给整颗胶囊的 focus-within，这里不再单独画 */
 
-#sendBtn {
+/* 发送 / 暂停合体：圆形，忙的时候就地变成暂停，不额外占位置 */
+.act-btn {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-family: inherit;
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
-  padding: 10px 19px;
-  border-radius: 8px;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 50%;
   border: 1px solid var(--ink);
   background: var(--ink);
   color: #fff;
   cursor: pointer;
-  transition: transform 0.12s ease, box-shadow 0.18s ease, opacity 0.15s;
+  transition: transform 0.12s ease, box-shadow 0.18s ease, opacity 0.15s, background 0.15s, color 0.15s;
 }
-#sendBtn:hover:not(:disabled) { box-shadow: 0 2px 10px rgba(23, 23, 26, 0.18); transform: translateY(-1px); }
-#sendBtn:active:not(:disabled) { transform: translateY(0) scale(0.985); box-shadow: none; }
-#sendBtn:disabled { opacity: 0.35; cursor: default; }
-
-/* 暂停：只在忙的时候出现，描边样式，别和「发送」抢注意力 */
-.stop-btn {
-  font-family: inherit;
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
-  padding: 10px 15px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
+.act-btn:hover:not(:disabled) { box-shadow: 0 2px 10px rgba(23, 23, 26, 0.18); transform: translateY(-1px); }
+.act-btn:active:not(:disabled) { transform: translateY(0) scale(0.94); box-shadow: none; }
+.act-btn:disabled { opacity: 0.35; cursor: default; }
+/* 忙：同一个按钮换成「停下」，描边款，别和发送抢注意力 */
+.act-btn[data-mode='stop'] {
   background: #fff;
-  color: var(--muted);
-  cursor: pointer;
-  transition: color 0.14s, border-color 0.14s;
+  color: var(--red);
+  border-color: #e7c4c4;
+  font-size: 11px;
 }
-.stop-btn:hover:not(:disabled) { color: var(--red); border-color: #e7c4c4; }
-.stop-btn:disabled { opacity: 0.5; cursor: default; }
-.stop-btn[hidden] { display: none; }
+.act-btn[data-mode='stop']:hover:not(:disabled) { box-shadow: 0 2px 10px rgba(200, 16, 46, 0.14); }
 
 /* ---------- 左下角设置入口 ---------- */
 .settings-btn {

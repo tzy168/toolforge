@@ -104,17 +104,30 @@ const PROBE = `(async () => {
       input.dispatchEvent(new InputEvent('input', { bubbles: true }));
       return input.value === 'typed-ok' && document.activeElement === input;
     })(),
-    stopVisible: !document.querySelector('#stopBtn').hidden,
-    toolCountText: document.querySelector('#headTools').textContent,
+    stopVisible: document.querySelector('#sendBtn').dataset.mode === 'stop',
+
     toolCountNumeric: parseInt(document.querySelector('#headTools').textContent, 10),
+    // 输入区是一颗两段式胶囊：上半输入、下半操作，工作区与模型都在操作栏里
+    barInsideComposer: !!document.querySelector('.composer > .composer-bar'),
+    modelChipInBar: !!document.querySelector('.composer-bar #modelPick'),
+    wsChipInBar: !!document.querySelector('.composer-bar #wsPick'),
+    modelChipText: document.querySelector('#modelChipName').textContent,
   };
 
-  // 暂停：点一下，应当尽快解锁输入并结束这一轮
-  document.querySelector('#stopBtn').click();
+  // 暂停：点一下，应当尽快解锁输入并结束这一轮。
+  // 先把打字测试残留的文本清掉，并确认按钮确实处在暂停态——发送与暂停是同一个按钮，
+  // 万一兜底超时已经先一步把它变回「发送」，这一击就会变成真发一条消息，把后面全带挂。
+  input.value = '';
+  input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+  const actBtn = document.querySelector('#sendBtn');
+  const stoppedInTime = actBtn.dataset.mode === 'stop';
+  if (stoppedInTime) actBtn.click();
   await sleep(1500);
   const afterStop = {
-    stopHidden: document.querySelector('#stopBtn').hidden,
+    stopHidden: document.querySelector('#sendBtn').dataset.mode === 'send',
     sendEnabled: !sendBtn.disabled,
+    // 暂停没赶上（这一轮已被兜底超时收掉）时如实记录，好区分「暂停坏了」和「探针太慢」
+    stoppedInTime,
     historySaved: JSON.parse(localStorage.getItem('toolforge.tasks') || '{}').tasks?.[0]?.history?.length || 0,
   };
 
@@ -180,14 +193,14 @@ const PROBE = `(async () => {
   input.dispatchEvent(new InputEvent('input', { bubbles: true }));
   document.querySelector('#composer').requestSubmit();
   await sleep(400);
-  const lockedWhileRunning = !document.querySelector('#stopBtn').hidden;
+  const lockedWhileRunning = document.querySelector('#sendBtn').dataset.mode === 'stop';
 
-  // 探针启动时用的是 ?turnTimeout=2000，这里多等一会儿让它自己收尾
-  await sleep(3500);
+  // 探针启动时用的是 TF_TURN_TIMEOUT=3000，这里多等一会儿让它自己收尾
+  await sleep(4200);
   const timeoutInfo = {
     lockedWhileRunning,
     unlockedByTimeout: !sendBtn.disabled,
-    stopGone: document.querySelector('#stopBtn').hidden,
+    stopGone: document.querySelector('#sendBtn').dataset.mode === 'send',
     noteShown: (document.body.textContent || '').includes('已自动停止'),
   };
 
@@ -204,8 +217,10 @@ const child = spawn(
       TOOLFORGE_HOME: home,
       TF_SMOKE: '1',
       TF_SMOKE_JS: PROBE,
-      // 把兜底超时压到 2 秒，好在一次探针里验证「卡住能自动解锁」
-      TF_TURN_TIMEOUT: '2000',
+      // 把兜底超时压到 3 秒：既能在一次探针里验证「卡住能自动解锁」，
+      // 又给第一阶段（发送 → 切任务 → 切回 → 打字 → 暂停，约 1.3s）留出足够余量。
+      // 压到 2 秒时余量只剩 700ms，机器一慢就撞上超时，暂停那一下会点空。
+      TF_TURN_TIMEOUT: '3000',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   }
@@ -234,8 +249,11 @@ const checks = [
   ['正在执行的那一轮被重建', r.liveRebuilt === true],
   ['输入框可编辑且能真的打字', r.inputDisabled === false && r.inputTypeable === true],
   ['执行中露出暂停按钮', r.stopVisible === true],
+  ['输入区是「上输入下操作」两段式', r.barInsideComposer === true],
+  ['工作区与模型都在操作栏里', r.wsChipInBar === true && r.modelChipInBar === true],
+  ['模型胶囊显示的是当前生效的模型', (r.modelChipText || '').includes('m')],
   ['工具数只数用户工具，不含元工具', r.toolCountNumeric > 0 && r.toolCountNumeric <= 4],
-  ['暂停后这一轮收尾、发送解锁', r.stopHidden === true && r.sendEnabled === true],
+  ['暂停后这一轮收尾、发送解锁', r.stoppedInTime === true && r.stopHidden === true && r.sendEnabled === true],
   ['暂停后问答仍留在历史里', r.historySaved >= 2],
   ['历史任务里能继续对话并拿到回复', r.gotReply === true && r.after > r.before],
   ['续聊完成后发送解锁（没卡死）', r.sendUnlocked === true],

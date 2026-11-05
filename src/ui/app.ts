@@ -996,16 +996,14 @@ async function refresh(): Promise<void> {
   $<HTMLSpanElement>('#toolCount').textContent = String(live.filter((t) => t.status !== 'pending').length);
   $<HTMLSpanElement>('#pendingCount').textContent = String(s.pending.length);
   $<HTMLSpanElement>('#statusLine').textContent = s.model;
-  // 没配模型时整台机器都跑不动，提示要够显眼，别只是一行灰字
-  const headModel = $<HTMLSpanElement>('#headModel');
-  headModel.textContent = s.model;
-  headModel.classList.toggle('unset', s.model === '未配置模型');
+  // 模型名现在显示在输入区那颗胶囊上（那里能直接切换），顶栏不再重复一遍
   $<HTMLSpanElement>('#headTools').textContent = `${s.toolCount} 件工具`;
   const home = $<HTMLSpanElement>('#homePath');
   home.textContent = s.home;
   home.title = s.home;
 
   renderModels(s.models);
+  renderModelChip(s.models);
   renderRuntime(s);
   renderDepPolicy(s);
 
@@ -1095,7 +1093,11 @@ function renderWorkspace(ws: TaskWorkspace): void {
   chip.classList.toggle('general', ws === 'general');
   name.textContent = workspaceLabel(ws);
   chip.title =
-    ws && ws !== 'general' ? `${ws}\n点击选择文件夹` : ws === 'general' ? '通用工作区：不绑定文件夹' : '本任务还没选工作区';
+    ws && ws !== 'general'
+      ? `${ws}\n点击切换工作区`
+      : ws === 'general'
+        ? '通用工作区：不绑定文件夹'
+        : '本任务还没选工作区，点击选择';
 }
 
 /* ---------------- 工具仓库筛选：等级 tab + 名称搜索 ---------------- */
@@ -1411,6 +1413,57 @@ async function fetchModels(
   onDone?.(ids);
 }
 
+/**
+ * 输入区那颗模型胶囊：显示当前生效的模型，点开就能切换。
+ *
+ * 以前换模型只能进设置页，而「换个模型再试一次」是对话中最常见的动作之一。
+ * 这里只做切换，不改 Key / Base URL——那些仍归设置页，别把两件事混在一起。
+ */
+function renderModelChip(models: ForgeState['models']): void {
+  const chip = $<HTMLButtonElement>('#modelPick');
+  const name = $<HTMLSpanElement>('#modelChipName');
+  const active = models.list.find((p) => p.id === models.active);
+  const ready = models.list.filter((p) => p.hasKey && p.model);
+
+  name.textContent = active ? active.model || active.label : '未配置模型';
+  chip.classList.toggle('unset', !active);
+  chip.title = active
+    ? `${active.label} · ${active.model}\n点击切换模型`
+    : ready.length
+      ? '还没选定模型，点击选择'
+      : '还没有可用的模型，去设置里填 API Key';
+
+  const menu = $<HTMLDivElement>('#modelMenu');
+  menu.innerHTML = '';
+
+  // 没有一家配好时，直接把人送去设置页，别在这里给一个空菜单
+  if (!ready.length) {
+    const tip = el('button', 'ws-option');
+    tip.type = 'button';
+    tip.dataset.act = 'settings';
+    const t = el('span', 'ws-opt-name');
+    t.textContent = '去设置里配置模型…';
+    const d = el('span', 'ws-opt-desc');
+    d.textContent = '填好 API Key 与模型名才能开始对话';
+    tip.append(t, d);
+    menu.appendChild(tip);
+    return;
+  }
+
+  for (const p of ready) {
+    const on = p.id === models.active;
+    const opt = el('button', `ws-option${on ? ' active' : ''}`);
+    opt.type = 'button';
+    opt.dataset.provider = p.id;
+    const n = el('span', 'ws-opt-name');
+    n.textContent = p.model || p.label;
+    const d = el('span', 'ws-opt-desc');
+    d.textContent = on ? `${p.label} · 当前` : p.label;
+    opt.append(n, d);
+    menu.appendChild(opt);
+  }
+}
+
 function renderModels(models: ForgeState['models']): void {
   const list = $<HTMLDivElement>('#modelList');
   list.innerHTML = '';
@@ -1559,10 +1612,13 @@ $<HTMLButtonElement>('#mpAdd').addEventListener('click', async () => {
 /* ---------------- 发送 ---------------- */
 
 /**
- * 同步输入区的状态：按钮可用性 + 占位文案。
+ * 同步输入区的状态：动作按钮的形态 + 占位文案。
  *
  * 输入框**永远不禁用**——切到别的任务时用户应该能接着说别的事，
  * 禁用还会让人以为程序卡死了。真正挡住重复提交的是 `busy` 这个标志。
+ *
+ * 发送与暂停是同一个按钮：忙的时候它原地变成「停下」。
+ * 两个按钮并排会让人在「想发」和「想停」之间多找一次，而这两种意图本来就不会同时发生。
  */
 function setBusy(v: boolean): void {
   busy = v;
@@ -1571,12 +1627,12 @@ function setBusy(v: boolean): void {
 
 function syncComposer(): void {
   const btn = $<HTMLButtonElement>('#sendBtn');
-  const stop = $<HTMLButtonElement>('#stopBtn');
-  btn.disabled = busy;
-  btn.title = busy ? '上一轮还在跑，等它结束' : '';
-  // 忙的时候露出「暂停」，用户随时能把跑偏的一轮掐掉
-  stop.hidden = !busy;
-  stop.disabled = false;
+  // 忙时这个按钮是「停下」，所以不能禁用——否则唯一的出口被自己关掉了
+  btn.disabled = false;
+  btn.dataset.mode = busy ? 'stop' : 'send';
+  btn.textContent = busy ? '■' : '↑';
+  btn.title = busy ? '暂停这一轮' : '发送（Enter）';
+  btn.setAttribute('aria-label', busy ? '暂停这一轮' : '发送');
   $<HTMLTextAreaElement>('#input').placeholder = busy
     ? '上一轮还在跑…可以先切到别的任务'
     : phase === 'create'
@@ -1584,7 +1640,19 @@ function syncComposer(): void {
       : '说说你要做什么…（Shift + Enter 换行）';
 }
 
-$<HTMLButtonElement>('#stopBtn').addEventListener('click', () => void stopRun());
+/**
+ * 动作按钮：忙的时候它是暂停，否则提交。
+ *
+ * 用 button[type=submit] 的点击事件而不是 form submit：暂停时不该触发提交，
+ * 而这个按钮在两种模式下的语义只有它自己知道。
+ */
+$<HTMLButtonElement>('#sendBtn').addEventListener('click', (e) => {
+  if (busy) {
+    e.preventDefault();
+    void stopRun();
+  }
+  // 空闲时交给 form 的 submit 事件走正常发送
+});
 
 function shorten(s: string, n: number): string {
   return s && s.length > n ? s.slice(0, n) + '…' : s || '';
@@ -1855,8 +1923,10 @@ async function send(text: string): Promise<void> {
 async function stopRun(): Promise<void> {
   if (!busy) return;
   await window.tf?.stop();
-  // 按钮立刻变灰，别让用户连点；真正解锁在 send() 的收尾里
-  $<HTMLButtonElement>('#stopBtn').disabled = true;
+  // 按钮立刻不可点，别让用户连点；真正解锁在 send() 的收尾里。
+  // 注意它同时是发送按钮，恢复可点由 setBusy(false) 统一负责。
+  const btn = $<HTMLButtonElement>('#sendBtn');
+  if (btn.dataset.mode === 'stop') btn.disabled = true;
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -1878,10 +1948,11 @@ $<HTMLTextAreaElement>('#input').addEventListener('keydown', (e) => {
 });
 
 /**
- * 按内容撑高输入框。超过 160px 才允许滚动——
+ * 按内容撑高输入框。超过上限才允许滚动——
  * 否则单行时 scrollHeight 比 clientHeight 多出的那零点几像素会让 Chromium 画出滚动条。
+ * 上限跟 CSS 里 #input 的 max-height 保持一致。
  */
-const INPUT_MAX = 160;
+const INPUT_MAX = 176;
 
 function growInput(input: HTMLTextAreaElement): void {
   input.style.height = 'auto';
@@ -1982,33 +2053,53 @@ $<HTMLButtonElement>('#exportBtn').addEventListener('click', async () => {
 
 $<HTMLSpanElement>('#homePath').addEventListener('click', () => window.tf?.openHome());
 
-/* 工作目录：左键选目录，已选中时右键清除 */
-/* ---------------- 工作区选择器 ---------------- */
+/* ---------------- 输入区下拉：工作区 / 模型 ---------------- */
 
-const wsMenu = $<HTMLDivElement>('#wsMenu');
-const wsMenuBtn = $<HTMLButtonElement>('#wsMenuBtn');
-
-function setMenuOpen(open: boolean): void {
-  wsMenu.hidden = !open;
-  wsMenuBtn.setAttribute('aria-expanded', String(open));
+/**
+ * 两个下拉共用一套开合逻辑。
+ *
+ * 以前只有工作区一个菜单，逻辑直接写在按钮上；模型也换成下拉之后，
+ * 再各写一份就会出现「打开模型菜单时工作区那个还开着」。这里收成一对函数。
+ */
+function menuOf(chip: HTMLButtonElement, menu: HTMLElement): { chip: HTMLButtonElement; menu: HTMLElement } {
+  return { chip, menu };
 }
 
-wsMenuBtn.addEventListener('click', (e) => {
-  e.stopPropagation();
-  setMenuOpen(wsMenu.hidden);
-});
+const wsPick = $<HTMLButtonElement>('#wsPick');
+const wsMenu = $<HTMLDivElement>('#wsMenu');
+const modelPick = $<HTMLButtonElement>('#modelPick');
+const modelMenu = $<HTMLDivElement>('#modelMenu');
+const menus = [menuOf(wsPick, wsMenu), menuOf(modelPick, modelMenu)];
 
-// 菜单内部的点击不要冒泡到 document，否则"点别处关闭"的逻辑会抢先把它关掉
-wsMenu.addEventListener('click', (e) => e.stopPropagation());
+/** 开关某一组；开的时候把另一组关掉，永远只会有一个浮层挡着输入框 */
+function setMenuOpen(target: { chip: HTMLButtonElement; menu: HTMLElement } | null, open: boolean): void {
+  for (const m of menus) {
+    const on = open && m === target;
+    m.menu.hidden = !on;
+    m.chip.setAttribute('aria-expanded', String(on));
+  }
+}
 
-// 点别处就收起，别让菜单挡着对话
+for (const m of menus) {
+  m.chip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(m, m.menu.hidden);
+  });
+  // 菜单内部的点击不要冒泡到 document，否则"点别处关闭"的逻辑会抢先把它关掉
+  m.menu.addEventListener('click', (e) => e.stopPropagation());
+}
+
+// 点别处就收起，别让菜单挡着输入框
 document.addEventListener('click', (e) => {
-  if (wsMenu.hidden) return;
-  if (wsMenu.contains(e.target as Node) || wsMenuBtn.contains(e.target as Node)) return;
-  setMenuOpen(false);
+  for (const m of menus) {
+    if (m.menu.hidden) continue;
+    if (m.menu.contains(e.target as Node) || m.chip.contains(e.target as Node)) continue;
+    setMenuOpen(null, false);
+    return;
+  }
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !wsMenu.hidden) setMenuOpen(false);
+  if (e.key === 'Escape') setMenuOpen(null, false);
 });
 
 /**
@@ -2028,7 +2119,7 @@ wsMenu.addEventListener('click', async (e) => {
   const opt = (e.target as HTMLElement).closest<HTMLElement>('.ws-option');
   if (!opt) return;
   const act = opt.dataset.act;
-  setMenuOpen(false);
+  setMenuOpen(null, false);
 
   if (act === 'general') {
     applyWorkspace('general');
@@ -2050,16 +2141,24 @@ wsMenu.addEventListener('click', async (e) => {
   }
 });
 
-// 点 chip 本体 = 选文件夹，最常用的一步不必先开菜单
-$<HTMLButtonElement>('#wsPick').addEventListener('click', async () => {
-  const res = await window.tf?.pickFolder();
-  if (!res) return;
-  if (!res.ok) {
+// 切模型：只切选中的那家，Key / Base URL 仍归设置页
+modelMenu.addEventListener('click', async (e) => {
+  const opt = (e.target as HTMLElement).closest<HTMLElement>('.ws-option');
+  if (!opt) return;
+  setMenuOpen(null, false);
+
+  if (opt.dataset.act === 'settings') {
+    showView('settings');
+    return;
+  }
+  const id = opt.dataset.provider;
+  if (!id) return;
+  const res = await window.tf?.setActiveProvider(id);
+  if (res && !res.ok) {
     alert(res.error);
     return;
   }
-  if (res.data.canceled || !res.data.path) return;
-  applyWorkspace(res.data.path);
+  refresh();
 });
 
 /* ---------------- 侧栏收放与设置页 ---------------- */
