@@ -80,15 +80,30 @@ export interface ChatResult {
 const HISTORY_CHAR_BUDGET = 20000;
 
 /**
+ * 空正文历史消息的占位。
+ *
+ * 模型被截断或只想了没说时，那一轮会以空正文落进 history。原样发回服务端，
+ * 会直接 400：`role='assistant'` 的消息不允许为空。
+ * 补一句占位而不是把它丢掉——丢掉会让两条 user 相邻，严格些的服务商同样不接受。
+ */
+const EMPTY_TURN_NOTE = '（这一轮模型没有返回正文）';
+
+/**
  * 只裁「真放不下」的那部分。
  *
  * 从后往前累计，超出预算就停；落点再往前挪到最近的一条 user，
  * 别让模型看到「只有答句、没有问句」的半轮。
+ *
+ * 这里是「历史 → 请求」的唯一出口，所以「不能发空消息」也收在这里管。
+ * 上层怎么存是它的事，发出去之前一定得是合法的。
  */
 export function trimHistory(history: ChatMessage[]): ChatMessage[] {
-  const rows = history.filter(
-    (m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'
-  );
+  const rows = history
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
+    .map((m) => {
+      const text = typeof m.content === 'string' ? m.content : '';
+      return { ...m, content: text.trim() ? text : EMPTY_TURN_NOTE };
+    });
   let used = 0;
   let start = rows.length;
   for (let i = rows.length - 1; i >= 0; i--) {

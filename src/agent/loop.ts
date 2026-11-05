@@ -42,6 +42,9 @@ export interface LlmUsage {
   completion: number;
 }
 
+/** 流结束的原因。length = token 用尽被截断，这是「正文是空的」最常见的原因 */
+export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
+
 export interface LoopOptions {
   client: OpenAI;
   model: string;
@@ -68,6 +71,9 @@ export interface LoopResult {
 /**
  * 流式拉一次 completion，把增量文本实时抛给调用方，同时把碎片拼回完整的 assistant 消息。
  * 拼回来的形状和非流式一致，后面处理 tool_calls 的代码不用区分。
+ *
+ * 额外带上 `finish_reason`：正文为空时，只有它能把「模型确实没话说」和
+ * 「token 被思考吃光、正文没来得及说」区分开——两者的处理方式完全不同。
  */
 async function streamOnce({
   client,
@@ -88,7 +94,7 @@ async function streamOnce({
   /** 本次请求的量。没回报就回调空值，别让上层把「没数据」当成「零命中」 */
   onUsage?: (usage: LlmUsage) => void;
   signal?: AbortSignal;
-}): Promise<ChatMessage> {
+}): Promise<{ message: ChatMessage; finishReason: FinishReason }> {
   const stream = await client.chat.completions.create(
     {
       model,
@@ -109,6 +115,8 @@ async function streamOnce({
   // index → 累积的工具调用碎片，流结束后按 index 顺序还原
   const calls = new Map<number, { id: string; name: string; args: string }>();
   let usage: LlmUsage | null = null;
+  // 为什么停了。正文为空时这是唯一能区分「模型没话说」和「token 被截断」的线索
+  let finishReason: FinishReason = null;
 
   for await (const chunk of stream) {
     // usage 只在最后一帧（通常是 choices 为空的那帧）出现，且各服务商字段名不一：
@@ -124,6 +132,10 @@ async function streamOnce({
         completion: Number(u.completion_tokens ?? 0) || 0,
       };
     }
+
+    const choice = chunk.choices?.[0] as { finish_reason?: string | null; delta?: any } | undefined;
+    // 截断与异常停止的唯一线索。只在有值时覆盖，别被中间帧的 null 冲掉
+    if (choice?.finish_reason) finishReason = choice.finish_reason as FinishReason;
 
     const delta = chunk.choices?.[0]?.delta as
       | {
@@ -167,9 +179,12 @@ async function streamOnce({
   if (usage) onUsage?.(usage);
 
   return {
-    role: 'assistant',
-    content: content || null,
-    ...(tool_calls.length ? { tool_calls } : {}),
+    message: {
+      role: 'assistant',
+      content: content || null,
+      ...(tool_calls.length ? { tool_calls } : {}),
+    },
+    finishReason,
   };
 }
 
@@ -198,8 +213,9 @@ export async function runLoop({
     onEvent({ type: 'step', step: step + 1, toolCount: userTools });
 
     let msg: ChatMessage;
+    let finishReason: FinishReason = null;
     try {
-      msg = await streamOnce({
+      const out = await streamOnce({
         client,
         model,
         messages,
@@ -209,6 +225,8 @@ export async function runLoop({
         onUsage,
         signal,
       });
+      msg = out.message;
+      finishReason = out.finishReason;
     } catch (err) {
       // 中止会让 fetch 抛 AbortError，这不是故障，按「用户主动停」处理
       if (signal?.aborted) {
@@ -224,7 +242,19 @@ export async function runLoop({
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
       if (msg.content) onEvent({ type: 'assistant', content: msg.content });
-      return { ok: true, reply: msg.content || '', steps: step + 1, messages };
+      // 正文为空却报成功，界面上会变成一句「（没有输出）」——用户完全无从判断发生了什么。
+      // 按 finish_reason 说清楚是哪种情况，别把三种不同的失败糊成同一句话。
+      if (!msg.content) {
+        const why =
+          finishReason === 'length'
+            ? '模型的输出额度被用完了（思考也算在内），正文还没开始就被截断。可以把任务拆小一点，或换一个上下文更宽的模型再试。'
+            : finishReason === 'content_filter'
+              ? '这次回答被服务商的内容过滤拦下了，没有返回正文。'
+              : '模型这回没有产出任何正文（只想了、没说）。直接重试通常就好；如果反复出现，说明这个任务对当前模型太复杂，拆成几步会更稳。';
+        audit.append({ type: 'llm_empty', step: step + 1, finishReason });
+        return { ok: false, reply: why, steps: step + 1, messages };
+      }
+      return { ok: true, reply: msg.content, steps: step + 1, messages };
     }
 
     if (msg.content) onEvent({ type: 'assistant', content: msg.content });

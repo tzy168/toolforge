@@ -1894,8 +1894,13 @@ async function send(text: string): Promise<void> {
   // （多步任务里丢的总是最后一步，正是要收进「任务过程」的那一段）。
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失
-  const answer = streamed || (aborted ? '（已暂停）' : '');
+  // 无论成败都把这一问一答落进 history：否则切走再回来，用户的问题凭空消失。
+  // 失败/暂停的原因也要一起存——只存空串的话，重开任务时那一轮就只剩一句
+  // 「（没有输出）」，当时到底为什么停的完全查不到。
+  // 兜底那半句不能省：空正文的 assistant 消息会在下一轮被原样发回服务端，直接 400。
+  const answer =
+    streamed ||
+    (aborted ? '（已暂停）' : failed ? `（这一轮没有完成：${failed}）` : '（这一轮没有返回正文）');
   recordTurn(task, text, answer);
   // 整条过程（思考 / 中间正文 / 工具，按真实顺序）一起留在任务上，重开也能按原位看
   persistProcess(task, liveRun, answer);

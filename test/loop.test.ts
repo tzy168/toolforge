@@ -108,6 +108,48 @@ test('循环能走通一次工具调用并收束', async () => {
   assert.match(String(toolMsg.content), /"words":2/);
 });
 
+test('模型返回空正文时不算成功，按 finish_reason 给出可读原因', async () => {
+  const { runLoop } = await import('../src/agent/loop.js');
+  // 正文为空、也没有工具调用——这正是界面上那句「（没有输出）」的来源
+  const stub = (finish: string) =>
+    ({
+      chat: {
+        completions: {
+          async create() {
+            return (async function* () {
+              yield { choices: [{ delta: { reasoning_content: '想了很多' }, finish_reason: null }] };
+              yield { choices: [{ delta: {}, finish_reason: finish }] };
+            })();
+          },
+        },
+      },
+    }) as any;
+
+  const run = (finish: string) =>
+    runLoop({
+      client: stub(finish),
+      model: 'm',
+      messages: [{ role: 'user', content: 'x' }],
+      toolProvider: () => [],
+      runTool: async () => ({ ok: true, result: null, ms: 0 }),
+    });
+
+  // 被截断：要说「额度用完了」，而不是让用户对着空白猜
+  const cut = await run('length');
+  assert.equal(cut.ok, false);
+  assert.match(cut.reply, /额度|截断/);
+
+  // 正常停止但一个字没说：也得算失败，并提示可以重试
+  const mute = await run('stop');
+  assert.equal(mute.ok, false);
+  assert.match(mute.reply, /没有产出|重试/);
+
+  // 内容被拦：同样是失败，但原因不同
+  const filtered = await run('content_filter');
+  assert.equal(filtered.ok, false);
+  assert.match(filtered.reply, /过滤/);
+});
+
 test('模型调用不存在的工具时，错误会回灌而不是崩溃', async () => {
   const tf = new ToolForge();
   await tf.init({ connectMcp: false });
@@ -217,6 +259,30 @@ test('历史只在超预算时才裁，且从问答边界起算', async () => {
   assert.ok(kept.length < 4, '超预算应裁掉最老的一轮');
   assert.equal(kept[0].role, 'user');
   assert.equal(kept.at(-1)!.content, big);
+});
+
+test('空正文的历史消息不会被发回服务端（否则 400 必须非空）', async () => {
+  const { trimHistory } = await import('../src/index.js');
+  // 上一轮模型被截断/只想了没说，history 里就留着这样一条空 assistant。
+  // 原样发回服务端会 400：the message at position N with role 'assistant' must not be empty
+  const hist = [
+    { role: 'user' as const, content: '重构 README' },
+    { role: 'assistant' as const, content: '' },
+    { role: 'user' as const, content: '继续呢' },
+  ];
+  const out = trimHistory(hist);
+  for (const m of out) {
+    assert.ok(String(m.content).trim().length > 0, `角色 ${m.role} 的消息不能是空的`);
+  }
+  // 数量不能变：丢掉空消息会让两条 user 相邻，严格的服务商同样不接受
+  assert.equal(out.length, hist.length);
+  // 问句要原样保留，占位只补在被清空的那条上
+  assert.equal(out[0].content, '重构 README');
+  assert.equal(out[2].content, '继续呢');
+
+  // 纯空白的 content 也算空
+  const blank = trimHistory([{ role: 'assistant' as const, content: '   \n ' }]);
+  assert.ok(blank.length === 0 || String(blank[0].content).trim().length > 0);
 });
 
 test('流式：usage 里的命中数被读出来（DeepSeek 与 OpenAI 两种字段名）', async () => {
