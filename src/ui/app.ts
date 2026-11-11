@@ -614,7 +614,13 @@ function emptyState(): HTMLElement {
   // 整行一次淡入即可：逐字错峰 + 模糊 + 高光叠上去，开场要两秒才静得下来。
   // 直接写文本，读屏器也不用再靠 aria-label 补一句。
   const hero = el('h1', 'hero');
-  hero.textContent = 'Forge what’s missing.';
+  // 两行对位：第一行实墨、第二行空心描边。拆成两个 span 是为了让描边只作用在第二行，
+  // 同时保留 h1 单节点的读屏语义（整句仍是一个标题）。
+  const l1 = el('span', 'hero-line');
+  l1.textContent = 'Forge';
+  const l2 = el('span', 'hero-line hollow');
+  l2.textContent = 'what’s missing.';
+  hero.append(l1, l2);
 
   const sub = el('p', 'hero-sub');
   sub.append('凡能力皆为工具——没有现成的，就');
