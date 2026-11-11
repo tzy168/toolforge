@@ -8,6 +8,9 @@ type Forge = import('../src/index.js', { with: { 'resolution-mode': 'import' } }
 let win: Electron.BrowserWindow | null = null;
 let forge: Forge | null = null;
 
+// 任务栏按 AppUserModelID 归组。不设的话窗口算在 electron.exe 上，图标一直是 Electron 的。
+if (process.platform === 'win32') app.setAppUserModelId('dev.toolforge.desktop');
+
 async function boot(): Promise<void> {
   const { ToolForge } = await import('../src/index.js');
   forge = new ToolForge({
@@ -26,6 +29,7 @@ function createWindow(): void {
     minHeight: 620,
     backgroundColor: '#ffffff',
     show: false,
+    icon: path.resolve(__dirname, '..', '..', 'src', 'ui', 'logo.png'),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),

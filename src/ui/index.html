@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
   <title>ToolForge</title>
+  <link rel="icon" href="logo.png" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -11,7 +12,7 @@
     <!-- 任务侧栏：记录每一段独立对话，可整体收起 -->
     <aside class="side" id="side">
       <div class="side-head">
-        <span class="side-brand">ToolForge</span>
+        <span class="side-brand"><img class="brand-mark" src="logo.png" alt="" width="20" height="20" />ToolForge</span>
         <button id="collapseBtn" class="icon-btn" title="收起侧栏">«</button>
       </div>
       <button id="newTaskBtn" class="new-task">＋ 新任务</button>
@@ -260,7 +261,7 @@
             <div class="pane" data-pane="about" hidden>
               <div class="group about-card">
                 <div class="about-brand">
-                  <div class="about-mark" aria-hidden="true">⚒</div>
+                  <img class="about-mark" src="logo.png" alt="" width="40" height="40" />
                   <div class="about-meta">
                     <div class="about-name">ToolForge<span id="aboutVersion" class="about-ver"></span></div>
                     <p class="about-desc" id="aboutDesc"></p>

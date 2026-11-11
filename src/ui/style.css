@@ -114,15 +114,13 @@ body {
   letter-spacing: 0.2px;
   white-space: nowrap;
 }
-/* 品牌标记：深底上墨色方块等于消失，所以翻成朱红——品牌色这次是真上场，
-   不再是白底上一小块勉强能看见的暗角。 */
-.side-brand::before {
-  content: '';
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  background: var(--red-grad);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+/* 标记本身是一枚墨底圆角徽章（锤、朱红火花、砧），深浅底都能站住，不再用 CSS 方块顶替。 */
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  display: block;
+  flex: 0 0 auto;
 }
 
 .icon-btn {
@@ -628,14 +626,8 @@ body {
   flex: 0 0 auto;
   width: 40px;
   height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 19px;
-  color: var(--ink);
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 11px;
+  border-radius: 10px;
+  display: block;
 }
 .about-meta { min-width: 0; }
 .about-name {

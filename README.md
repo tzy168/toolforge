@@ -1,5 +1,7 @@
 # ToolForge
 
+<img src="./src/ui/logo.png" width="72" height="72" alt="ToolForge" />
+
 > **Tool Is All You Need.**
 
 **创建你自己的 Agent。** 模型负责决策，工具负责把决策变成可验证、可授权、可审计、可复用的行动。
