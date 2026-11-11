@@ -10,12 +10,17 @@ import { metaToolDefs, findMetaTool } from './agent/meta-tools.js';
 import { buildSystemMessages, META_TOOL_NAMES, type Phase, type ChatMessage } from './agent/prompts.js';
 import { runLoop, createClient, type ToolBundle } from './agent/loop.js';
 import { planSharedDeps, readDepPolicy } from './core/deps.js';
+import {
+  filterTools, getAccessLevel, hiddenToolNames, metaDenied, normalizeAccess,
+  setAccessLevel as setGlobalAccessLevel,
+} from './core/policy.js';
+import { cancelAll, pendingApprovals, resolveApproval, setApprovalEmitter, setApprovalResponder } from './core/approval.js';
 import { permissionSupport } from './executors/script.js';
 import { mcp } from './mcp/client.js';
 import { exportPack, savePack, importPack, readPackFile, type Pack, type ImportResult } from './core/pack.js';
 import { mergeProviders, pickActive, toView, fetchModelIds, type ModelProvider, type ProviderView } from './core/models.js';
 import * as audit from './core/audit.js';
-import type { AgentEvent, Json, Tool, ToolResult, ToolSummary } from './types.js';
+import type { AccessLevel, AgentEvent, ApprovalDecision, ApprovalRequest, Json, Tool, ToolResult, ToolSummary } from './types.js';
 import type OpenAI from 'openai';
 
 export interface Settings {
@@ -36,6 +41,8 @@ export interface Settings {
    * 所以只能由用户在设置页显式点一次，绝不能由 agent 自己改。
    */
   allowUnvettedDeps?: boolean;
+  /** 访问档位。老配置没这个字段时按 full 处理，见 core/policy.ts */
+  access?: AccessLevel;
 }
 
 export interface ForgeState {
@@ -55,6 +62,8 @@ export interface ForgeState {
   sandbox: { probed: boolean; flag: string | null };
   /** 三方依赖策略：界面据此展示「能不能联网装」与白名单内容 */
   depPolicy: { allowUnvettedDeps: boolean; origin: string; sharedDepsRoot: string | null; whitelist: string[] };
+  /** 当前访问档位与还挂着的人工确认请求 */
+  access: { level: AccessLevel; pending: ApprovalRequest[] };
   audit: audit.AuditEvent[];
 }
 
@@ -264,15 +273,26 @@ export class ToolForge {
   /** 当前这一轮的中止控制器。AbortSignal 用过就废，每轮 chat 开始都要新建一个 */
   private _abort = new AbortController();
 
-  constructor({ onEvent }: { onEvent?: (event: AgentEvent) => void } = {}) {
+  constructor({
+    onEvent,
+    approvalResponder,
+  }: {
+    onEvent?: (event: AgentEvent) => void;
+    /** 非交互环境注入自动应答；桌面端不传，走界面弹确认 */
+    approvalResponder?: (req: ApprovalRequest) => Promise<ApprovalDecision> | ApprovalDecision;
+  } = {}) {
     ensureDirs();
     this.onEvent = onEvent ?? (() => {});
     this.sessionId = `s_${Date.now().toString(36)}`;
     this.settings = loadSettings();
+    // 授权事件沿 AgentEvent 走 IPC 到界面；responder 只给 CLI 与测试用
+    setApprovalEmitter((event) => this.onEvent(event));
+    setApprovalResponder(approvalResponder ?? null);
   }
 
   async init({ connectMcp = true }: { connectMcp?: boolean } = {}): Promise<this> {
     this.seeded = installSeeds();
+    setGlobalAccessLevel(this.settings.access);
     // 恢复上次选的工作目录。目录可能已被删掉或挪走，那就当没选，
     // 而不是留一个指向虚空的路径让工具跑到一半才崩。
     const saved = this.settings.workspace;
@@ -445,13 +465,22 @@ export class ToolForge {
   }
 
   async runTool(name: string, args: Json = {}, depth = 0): Promise<ToolResult> {
+    // 元工具不经 executeTool，档位这道闸得在门面层补上，否则「仅可查看」还能造工具、删工具
+    const denied = metaDenied(name, args, getAccessLevel());
+    if (denied) {
+      audit.append({ type: 'meta_denied', tool: name, level: getAccessLevel() });
+      return { ok: false, error: denied, ms: 0 };
+    }
     const meta = findMetaTool(name);
     if (meta) {
       const started = Date.now();
       try {
         const out = await meta.handler(args, {
           sessionId: this.sessionId,
-          allTools: () => this.allTools(),
+          access: getAccessLevel(),
+          // 自省工具也只看得到当前档位允许的工具，否则列一眼全量仓库又会去试被拦的那些
+          allTools: () => filterTools(this.allTools(), getAccessLevel()),
+          hiddenTools: () => hiddenToolNames(this.allTools(), getAccessLevel()),
           runTool: (n, a, d) => this.runTool(n, a, d),
         });
         audit.append({ type: 'meta_call', tool: name, ok: true, ms: Date.now() - started });
@@ -468,6 +497,8 @@ export class ToolForge {
     return executeTool(tool, args, {
       sessionId: this.sessionId,
       depth,
+      access: getAccessLevel(),
+      signal: this._abort.signal,
       runner: (n, a, d) => this.runTool(n, a, d),
     });
   }
@@ -485,17 +516,26 @@ export class ToolForge {
     phase = 'work',
     history = [],
     workspace,
+    access,
   }: {
     input: string;
     phase?: Phase;
     history?: ChatMessage[];
     workspace?: string | null;
+    access?: AccessLevel;
   }): Promise<ChatResult> {
     if (workspace !== undefined) setWorkspaceDir(workspace);
+    // 档位与工作区一样按轮传入：每个任务存自己的档位，切任务太快也不会拿到上一个任务的
+    if (access !== undefined) setGlobalAccessLevel(access);
     // 每轮换一个新的控制器：上一轮的 signal 已经 aborted，复用会导致一开跑就被中止
     this._abort = new AbortController();
+    // 提示词里的工具清单也按档位裁剪：模型看到的名单与能调的 schema 必须一致，
+    // 否则它照着 inventory 去调一件被闸门拦下的工具，又要白撞一次。
+    const level = getAccessLevel();
+    const repo = this.allTools();
+    const visible = filterTools(repo, level);
     const messages: ChatMessage[] = [
-      ...buildSystemMessages(phase, this.allTools(), getWorkspace()),
+      ...buildSystemMessages(phase, visible, getWorkspace(), level, hiddenToolNames(repo, level)),
       ...trimHistory(history),
       { role: 'user', content: input },
     ];
@@ -509,9 +549,11 @@ export class ToolForge {
     // 现在只在「工具清单真变了」（刚造了新工具/刚放行）时重算，造完照样当场能用。
     let frozen: { sig: string; bundles: ToolBundle[] } | null = null;
     const toolProvider = (): ToolBundle[] => {
-      const all = this.allTools();
-      // 指纹带版本：同名工具被重建（schema 变了）必须重算，否则这一轮会拿旧 schema 去校验
-      const sig = all
+      // 档位不允许的工具连 schema 都不注入：看不见就不会被调用，比执行时再拦早一步
+      const levelNow = getAccessLevel();
+      const all = filterTools(this.allTools(), levelNow);
+      // 指纹带档位与版本：人中途切了档位、或同名工具被重建，都要重算注入集合
+      const sig = `${levelNow}\n` + all
         .map((t) => `${t.name}@${t.version}`)
         .sort()
         .join('\n');
@@ -521,7 +563,9 @@ export class ToolForge {
         .filter((m) => m.role === 'user')
         .map((m) => String(m.content ?? ''))
         .join(' ');
-      const picked = selectTools(all, query, { limit: 14, always: META_TOOL_NAMES });
+      // create_tool 在只读档下被隐藏，置顶名单也得跟着摘掉，否则又被强行塞回 schema
+      const always = META_TOOL_NAMES.filter((name) => all.some((t) => t.name === name));
+      const picked = selectTools(all, query, { limit: 14, always });
       frozen = { sig, bundles: picked.map((t) => ({ openai: toOpenAITool(t) as ToolBundle['openai'], tool: t })) };
       return frozen.bundles;
     };
@@ -569,9 +613,34 @@ export class ToolForge {
     return this.state();
   }
 
+  /**
+   * 切换访问档位。只能由人在界面上点，和「联网装依赖」一样是一次显式授权。
+   * 落进 settings.json，下次启动沿用；审计里单独留一条，事后能查到是谁、什么时候放宽的。
+   */
+  setAccessLevel(level: AccessLevel): ForgeState {
+    const next = normalizeAccess(level);
+    setGlobalAccessLevel(next);
+    this.settings.access = next;
+    this.persist();
+    audit.append({ type: 'access_level', level: next, by: 'human' });
+    return this.state();
+  }
+
+  /**
+   * 界面把人的选择送回来。这一步只 resolve 那个挂起的 Promise，
+   * 真正的「回灌给模型」由 executeTool 返回的错误/结果经 loop.ts 完成。
+   */
+  decideApproval(id: string, decision: ApprovalDecision): { ok: boolean } {
+    const ok = resolveApproval(id, decision);
+    audit.append({ type: 'approval_human', id, decision, by: 'human', found: ok });
+    return { ok };
+  }
+
   /** 暂停当前这一轮。不抛错，aborting 后 chat() 会带着 aborted=true 正常返回 */
   stop(): void {
     this._abort.abort();
+    // 还挂着的授权请求一并按拒绝收尾，别让一轮对话留个永不 resolve 的 Promise
+    cancelAll();
     audit.append({ type: 'chat_stop', by: 'human' });
   }
 
@@ -657,6 +726,7 @@ export class ToolForge {
         sharedDepsRoot: pool.sharedDepsRoot,
         whitelist: Object.keys(pool.whitelist).sort(),
       },
+      access: { level: getAccessLevel(), pending: pendingApprovals() },
       audit: audit.tail(40),
     };
   }

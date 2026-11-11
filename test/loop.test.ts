@@ -19,6 +19,17 @@ const { validateArgs } = await import('../src/core/bus.js');
 const { pathAllowed } = await import('../src/core/permissions.js');
 const { readJsonFile, getWorkspace } = await import('../src/core/paths.js');
 const { buildScriptArgs } = await import('../src/executors/script.js');
+const {
+  classifyCommand, effectivePermissions, accessDenies, metaDenied, toolAvailable,
+  filterTools, hiddenToolNames, normalizeAccess,
+  setAccessLevel: setGlobalAccessLevel, getAccessLevel,
+} = await import('../src/core/policy.js');
+const {
+  setApprovalResponder, setApprovalEmitter, clearGrants,
+  requestApproval, resolveApproval, pendingApprovals,
+} = await import('../src/core/approval.js');
+const { runDeclarative } = await import('../src/executors/declarative.js');
+const { buildSystemMessages } = await import('../src/agent/prompts.js');
 type ToolForgeType = InstanceType<typeof ToolForge>;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -912,4 +923,335 @@ test('http 逐跳校验重定向：同主机可跟随，跨主机被域名白名
   } finally {
     server.close();
   }
+});
+
+/* ---------------- 命令分级 / 三级档位 / human-in-loop ---------------- */
+
+/** 造一件 active 的 shell 工具，跳过 create_tool 的用例门槛，专测执行闸门 */
+function shellProbe(name: string, command: string, args: string[] = []): void {
+  store.save(
+    normalizeTool({
+      name,
+      description: '命令分级探针：验证执行闸门与人工确认链路。',
+      kind: 'shell',
+      impl: { command, args },
+      permissions: { exec: true },
+      examples: [{ args: {} }],
+      status: 'active',
+      trust: 'L3',
+      sessionId: null,
+    })
+  );
+}
+
+/** policy / approval 都是模块级单例，每条用例开头归零，别互相串味 */
+function resetPolicy(): void {
+  setApprovalResponder(null);
+  setApprovalEmitter(() => {});
+  clearGrants();
+  setGlobalAccessLevel('full');
+}
+
+test('命令分级：禁止 / 允许 / 需确认三档，禁止清单不接受人工放行', () => {
+  resetPolicy();
+  assert.equal(classifyCommand('rm', ['-rf', '/'], '', 'full').decision, 'deny');
+  assert.equal(classifyCommand('powershell', ['-c', 'x'], '', 'full').decision, 'deny');
+  assert.equal(classifyCommand('git', ['push'], '', 'full').decision, 'deny');
+  assert.equal(classifyCommand('git', ['reset', '--hard'], '', 'full').decision, 'deny');
+  assert.equal(classifyCommand('echo', ['hello'], '', 'full').decision, 'allow');
+  assert.equal(classifyCommand('git', ['status'], '', 'full').decision, 'allow');
+  assert.equal(classifyCommand('node', ['-e', 'x'], '', 'full').decision, 'confirm');
+  assert.equal(classifyCommand('curl', ['https://example.com'], '', 'full').decision, 'confirm');
+  assert.equal(classifyCommand('git', ['commit', '-m', 'x'], '', 'full').decision, 'confirm');
+  assert.equal(classifyCommand('echo', ['-e', 'x'], '', 'full').decision, 'confirm', '参数带执行开关要升级为请示');
+  assert.equal(classifyCommand('some_random_bin', [], '', 'full').decision, 'deny', '清单外默认拒绝');
+  assert.equal(classifyCommand('echo', ['hi'], '', 'readonly').decision, 'deny', '仅可查看下连只读命令也不跑');
+});
+
+test('三级档位：权限只收窄不放宽，readonly 拦写 / 命令 / 造工具', async () => {
+  resetPolicy();
+  const base = normalizeTool({
+    name: 'probe_access',
+    description: '权限档位探针：声明读写与命令能力。',
+    kind: 'shell',
+    impl: { command: 'echo', args: [] },
+    permissions: {
+      net: ['api.example.com'], fsRead: ['notes'], fsWrite: ['notes', '@workspace'],
+      exec: true, env: ['API_KEY'],
+    },
+    examples: [{ args: {} }],
+  });
+
+  assert.equal(effectivePermissions(base, 'full').exec, true);
+  assert.equal(effectivePermissions(base, 'full').fsWrite.length, 2, 'full 不改原声明');
+  const ws = effectivePermissions(base, 'workspace');
+  assert.deepEqual(ws.fsWrite, ['@workspace'], '工作区档只留 @workspace');
+  assert.equal(ws.net.length, 1, '收窄只动写，不误伤读');
+  const ro = effectivePermissions(base, 'readonly');
+  assert.equal(ro.exec, false);
+  assert.deepEqual(ro.fsWrite, []);
+  assert.deepEqual(ro.env, [], '只读档不该读到密钥');
+  assert.equal(ro.fsRead.length, 1);
+  assert.equal(base.permissions.fsWrite.length, 2, '收窄不得改落盘规格');
+
+  assert.match(accessDenies(base, 'readonly') || '', /仅可查看/);
+  assert.equal(accessDenies(base, 'full'), null);
+  assert.match(metaDenied('create_tool', {}, 'readonly') || '', /不能造工具/);
+  assert.match(metaDenied('manage_tool', { action: 'remove' }, 'readonly') || '', /仅可查看/);
+  assert.equal(metaDenied('manage_tool', { action: 'inspect' }, 'readonly'), null);
+  assert.equal(normalizeAccess('nonsense'), 'full');
+
+  assert.match(buildSystemMessages('work', [], null, 'readonly')[0].content, /仅可查看/);
+  assert.match(buildSystemMessages('work', [], null, 'full')[0].content, /允许完全访问/);
+
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  shellProbe('probe_readonly', 'echo', ['hi']);
+  tf.setAccessLevel('readonly');
+  const blocked = await tf.runTool('probe_readonly', {});
+  assert.equal(blocked.ok, false, '仅可查看下命令必须被拦');
+  assert.match(blocked.error || '', /仅可查看/);
+  const meta = await tf.runTool('create_tool', { name: 'x' });
+  assert.equal(meta.ok, false, '元工具不经 executeTool，也得挡住');
+  assert.match(meta.error || '', /不能造工具/);
+  tf.setAccessLevel('full');
+  resetPolicy();
+});
+
+test('human-in-loop：用户拒绝的结果作为 tool result 回灌模型', async () => {
+  resetPolicy();
+  const tf = new ToolForge({ approvalResponder: () => 'deny' });
+  await tf.init({ connectMcp: false });
+  shellProbe('probe_deny', 'node', ['-e', 'console.log(1)']);
+
+  const r = await tf.runTool('probe_deny', {});
+  assert.equal(r.ok, false);
+  assert.match(r.error || '', /用户拒绝了/);
+  assert.match(r.error || '', /不要换写法重试/);
+
+  // 真正验证「继续喂给 AI」：跑一轮循环，检查 role=tool 的消息里带着人的决定
+  const messages: any[] = [];
+  await runLoop({
+    client: mockClient([
+      { content: '', tool_calls: [{ id: 'c1', function: { name: 'probe_deny', arguments: '{}' } }] },
+      { content: '明白，我改用只读方式。' },
+    ]),
+    model: 'mock',
+    messages,
+    toolProvider: provider(tf),
+    runTool: (n, a) => tf.runTool(n, a),
+    maxSteps: 3,
+  });
+  const toolMsg = messages.find((m) => m.role === 'tool');
+  assert.match(String(toolMsg?.content ?? ''), /用户拒绝了/);
+  resetPolicy();
+});
+
+test('human-in-loop：允许一次能放行，本会话允许不再重复请示', async () => {
+  resetPolicy();
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  shellProbe('probe_allow', 'node', ['-e', 'console.log(1)']);
+
+  let asks = 0;
+  setApprovalResponder(() => { asks += 1; return 'allow_once'; });
+  const once = await tf.runTool('probe_allow', {});
+  assert.doesNotMatch(once.error || '', /用户拒绝了|需要人工确认/, once.error || 'ok');
+  assert.equal(asks, 1);
+  await tf.runTool('probe_allow', {});
+  assert.equal(asks, 2, 'allow_once 每次都要重新问');
+
+  clearGrants();
+  asks = 0;
+  setApprovalResponder(() => { asks += 1; return 'allow_always'; });
+  await tf.runTool('probe_allow', {});
+  await tf.runTool('probe_allow', {});
+  assert.equal(asks, 1, 'allow_always 之后不该再问第二次');
+  resetPolicy();
+});
+
+test('执行器二次校验：绕过 executeTool 直接调用时命令落不下去', async () => {
+  resetPolicy();
+  const needConfirm = normalizeTool({
+    name: 'probe_direct', description: '绕过闸门探针：需确认的命令。', kind: 'shell',
+    impl: { command: 'node', args: ['-e', 'x'] },
+    permissions: { exec: true }, examples: [{ args: {} }],
+  });
+  await assert.rejects(
+    () => runDeclarative(needConfirm, {}, { sessionId: null, access: 'full', run: async () => null }),
+    /需要人工确认/
+  );
+  const hardDeny = normalizeTool({
+    name: 'probe_direct_deny', description: '绕过闸门探针：禁止清单里的命令。', kind: 'shell',
+    impl: { command: 'rm', args: ['-rf', '/'] },
+    permissions: { exec: true }, examples: [{ args: {} }],
+  });
+  await assert.rejects(
+    () => runDeclarative(hardDeny, {}, { sessionId: null, access: 'full', commandApproved: true, run: async () => null }),
+    /命令被禁止/,
+    '禁止清单不接受人工放行'
+  );
+});
+
+test('人工确认队列：超时按拒绝收尾，重复点击不生效', async () => {
+  resetPolicy();
+  const p = requestApproval({ tool: 't', action: 'a', reason: 'r', level: 'full', grantKey: 'g1', timeoutMs: 500 });
+  await new Promise((r) => setTimeout(r, 5));
+  const list = pendingApprovals();
+  assert.equal(list.length, 1);
+  assert.equal(resolveApproval(list[0].id, 'allow_once'), true);
+  assert.equal((await p).decision, 'allow_once');
+  assert.equal(resolveApproval(list[0].id, 'deny'), false, '重复点击不该生效');
+
+  const timed = await requestApproval({
+    tool: 't', action: 'a', reason: 'r', level: 'full', grantKey: 'g2', timeoutMs: 20,
+  });
+  assert.equal(timed.decision, 'deny');
+  assert.equal(timed.timedOut, true);
+  assert.equal(pendingApprovals().length, 0);
+});
+
+test('chat 逐轮传 access：每轮覆盖全局档位，undefined 表示沿用', async () => {
+  resetPolicy();
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  const probe = async (level: any) => {
+    try {
+      await tf.chat({ input: 'x', access: level, history: [] });
+    } catch {
+      /* 没配模型必然抛错，我们只关心档位是否已落地 */
+    }
+    return getAccessLevel();
+  };
+  assert.equal(await probe('readonly'), 'readonly');
+  assert.equal(await probe('workspace'), 'workspace');
+  assert.equal(await probe(undefined), 'workspace');
+  assert.equal(await probe('full'), 'full');
+  assert.equal(tf.setAccessLevel('readonly').access.level, 'readonly');
+  assert.equal(tf.state().access.level, 'readonly');
+  tf.setAccessLevel('full');
+  resetPolicy();
+});
+
+/* ---------------- 权限前置：模型在选工具之前就该看到边界 ---------------- */
+
+test('按档位裁剪工具可见性：写工具与造工具在只读档下不出现', () => {
+  resetPolicy();
+  const mk = (name: string, permissions: Record<string, unknown>, kind = 'script') =>
+    normalizeTool({
+      name, description: `可见性探针：${name} 的权限声明。`, kind,
+      impl: kind === 'script' ? { code: 'module.exports = async () => 1;' } : { command: 'echo' },
+      permissions, examples: [{ args: {} }], status: 'active',
+    });
+  const readOnlyTool = mk('probe_readonly_ok', { fsRead: ['@workspace'] });
+  const writeTool = mk('probe_write_hidden', { fsWrite: ['@workspace'] });
+  const cmdTool = mk('probe_exec_hidden', { exec: true }, 'shell');
+  // meta 不是可入库的 kind（normalizeTool 会拒），直接从门面拿现成的元工具
+  const metas = new ToolForge().allTools().filter((t) => t.kind === 'meta');
+  const createMeta = metas.find((t) => t.name === 'create_tool')!;
+  const listMeta = metas.find((t) => t.name === 'list_tools')!;
+
+  assert.equal(toolAvailable(readOnlyTool, 'readonly'), true);
+  assert.equal(toolAvailable(writeTool, 'readonly'), false);
+  assert.equal(toolAvailable(cmdTool, 'readonly'), false);
+  assert.equal(toolAvailable(createMeta, 'readonly'), false, '造工具也得藏起来，否则模型会另造一件绕过');
+  assert.equal(toolAvailable(listMeta, 'readonly'), true);
+  assert.equal(toolAvailable(writeTool, 'workspace'), true, '写 @workspace 在 workspace 档可用');
+  assert.equal(toolAvailable(mk('probe_write_local', { fsWrite: ['notes'] }), 'workspace'), false);
+  assert.equal(toolAvailable(writeTool, 'full'), true);
+
+  const all = [readOnlyTool, writeTool, cmdTool, createMeta, listMeta];
+  assert.deepEqual(filterTools(all, 'readonly').map((t) => t.name), ['probe_readonly_ok', 'list_tools']);
+  assert.deepEqual(hiddenToolNames(all, 'readonly'), ['probe_write_hidden', 'probe_exec_hidden', 'create_tool']);
+  assert.equal(hiddenToolNames(all, 'full').length, 0);
+});
+
+test('档位说明置于系统消息最前，并点名被隐藏的工具', () => {
+  resetPolicy();
+  const hidden = ['write_a', 'dev_node', 'git_run'];
+  const sys = buildSystemMessages('work', [], null, 'readonly', hidden)[0].content;
+  assert.ok(sys.startsWith('## 第一优先'), '权限必须在人格提示之前');
+  assert.match(sys, /不要调用任何工具去试探/);
+  assert.match(sys, /已隐藏 3 件工具：write_a、dev_node、git_run/);
+  assert.match(sys, /工作区内修改/);
+  assert.ok(sys.indexOf('## 第一优先') < sys.indexOf('## 干活的原则'));
+  assert.match(buildSystemMessages('work', [], null, 'readonly', hidden)[0].content, /权限先行/);
+});
+
+/** 捕获真正发给模型请求，验证档位裁剪落到了 function calling 的 schema 上 */
+function captureClient(cap: { tools: string[]; system: string }): any {
+  return {
+    chat: {
+      completions: {
+        async create(req: any) {
+          cap.tools = (req.tools || []).map((t: any) => t.function.name);
+          cap.system = String(req.messages?.[0]?.content ?? '');
+          return (async function* () {
+            yield { choices: [{ delta: { content: '好' } }] };
+            yield { choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } };
+          })();
+        },
+      },
+    },
+  };
+}
+
+test('chat 在只读档下不把写工具与 create_tool 注入模型，切回 full 后恢复', async () => {
+  resetPolicy();
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  store.save(
+    normalizeTool({
+      name: 'probe_inject_write', description: '注入探针：一件需要写盘的工具。', kind: 'script',
+      impl: { code: 'module.exports = async () => 1;' },
+      permissions: { fsWrite: ['@workspace'] },
+      examples: [{ args: {} }], status: 'active',
+    })
+  );
+
+  const cap = { tools: [] as string[], system: '' };
+  Object.defineProperty(tf, 'client', { value: captureClient(cap), configurable: true });
+
+  await tf.chat({ input: '改一下 README.md', access: 'readonly', history: [] });
+  assert.ok(!cap.tools.includes('create_tool'), '置顶名单也得跟着档位摘掉');
+  assert.ok(!cap.tools.includes('probe_inject_write'), '写工具不该出现在 schema 里');
+  assert.ok(cap.tools.includes('list_tools'), '只读元工具仍要可用');
+  assert.match(cap.system.slice(0, 120), /第一优先：当前权限档位 = 仅可查看/);
+  assert.match(cap.system, /不要调用任何工具去试探/);
+  assert.match(cap.system, /已隐藏 \d+ 件工具/);
+
+  await tf.chat({ input: '改一下 README.md', access: 'full', history: [] });
+  assert.ok(cap.tools.includes('create_tool'), '切回完全访问后恢复');
+  assert.ok(cap.tools.includes('probe_inject_write'));
+  tf.setAccessLevel('full');
+  resetPolicy();
+});
+
+test('自省工具也按档位收口：list_tools 标出被隐藏的工具，搜索不再命中', async () => {
+  resetPolicy();
+  const tf = new ToolForge();
+  await tf.init({ connectMcp: false });
+  store.save(
+    normalizeTool({
+      name: 'probe_list_hidden', description: '自省探针：一件需要写盘的工具。', kind: 'script',
+      impl: { code: 'module.exports = async () => 1;' },
+      permissions: { fsWrite: ['@workspace'] },
+      examples: [{ args: {} }], status: 'active',
+    })
+  );
+  tf.setAccessLevel('readonly');
+
+  const r = await tf.runTool('list_tools', {});
+  const data = r.ok ? JSON.parse(String(r.result)) : {};
+  const row = (data.tools || []).find((x: any) => x.name === 'probe_list_hidden');
+  assert.equal(row?.blockedByAccess, true);
+  assert.equal(row?.callable, false);
+  assert.equal((data.tools || []).some((x: any) => x.name === 'create_tool'), false, '造工具也不该列出来');
+  assert.match(String(data.hint || ''), /不要调用/);
+
+  const search = await tf.runTool('tool_search', { query: 'probe_list_hidden' });
+  const sd = search.ok ? JSON.parse(String(search.result)) : {};
+  assert.equal((sd.matched || []).some((x: any) => x.name === 'probe_list_hidden'), false);
+  tf.setAccessLevel('full');
+  resetPolicy();
 });

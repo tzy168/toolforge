@@ -1,5 +1,6 @@
 // 两套人格：干活的和锻造的。工具集与权限都不同，别合并。
-import type { Tool } from '../types.js';
+import { ACCESS_DESC, ACCESS_LABEL, DEFAULT_ACCESS } from '../core/policy.js';
+import type { AccessLevel, Tool } from '../types.js';
 
 export const META_TOOL_NAMES = ['tool_search', 'list_tools', 'create_tool'];
 
@@ -37,10 +38,10 @@ ${workspaceNote(workspace)}
 ${inventory(tools)}
 
 ## 干活的原则
-1. 先想再动。任务需要哪些能力，心里先过一遍。
+1. **权限先行**：先看系统消息最上方的档位。任务需要档位不允许的动作时，第一句话就说明并给替代方案，**不要调用工具试探**；工具清单里没出现的，当前就是不可用，别去找、也别另造一件绕过。
 2. 现有工具够用就直接用，别重复造轮子；不确定有哪些，先调 list_tools 或 tool_search。
-3. 确实缺能力时，调 create_tool 现造一个。造出来当场就能用，但只在本会话有效；要长期留着，得用户点头放行。
-4. 工具失败不要硬扛：读错误信息，改参数或改实现，再来一次。同一件事最多试三次，三次不成如实说明卡在哪。
+3. 确实缺能力、且档位允许时，才调 create_tool 现造一个。造出来当场就能用，但只在本会话有效；要长期留着，得用户点头放行。
+4. 工具失败不要硬扛：先读错误是不是档位/权限类限制，是就停手问人；不是才改参数或实现，同一件事最多试三次，三次不成如实说明卡在哪。
 5. 有副作用之前（写文件、发网络请求、删改数据），先用一句话说清你要做什么。
 6. 拿不准就问，不要猜着往下走。
 
@@ -91,7 +92,36 @@ export interface ChatMessage {
   content: string;
 }
 
-export function buildSystemMessages(phase: Phase, tools: Tool[], workspace?: string | null): ChatMessage[] {
+/**
+ * 档位说明放在系统消息**最前面**，不是挂在末尾当补注。
+ * 模型是先读开头再决定调什么工具的；权限若排在人格之后，它就先挑顺手的工具试，
+ * 撞了七八次墙才想起看档位。被隐藏的工具要点名，否则它会以为「仓库里没有」又去造一件。
+ */
+function accessNote(level: AccessLevel, hidden: string[]): string {
+  const hiddenLine = hidden.length
+    ? `\n当前档位已隐藏 ${hidden.length} 件工具：${hidden.slice(0, 16).join('、')}${hidden.length > 16 ? '…' : ''}。它们此刻不可用，不要尝试调用，也不要另造一件来绕过。`
+    : '';
+  const higher = level === 'readonly' ? '工作区内修改' : '允许完全访问';
+  return `## 第一优先：当前权限档位 = ${ACCESS_LABEL[level]}
+${ACCESS_DESC[level]}。${hiddenLine}
+
+**开工前先判档位，再想怎么动。** 任务只要需要档位不允许的动作（写文件、跑命令、造工具、改远端数据），
+第一句话就告诉用户「需要把权限档位切到「${higher}」或更高」，并给出一个不依赖写入的替代方案
+（例如：请用户把内容贴过来，你先给出优化后的版本，由用户自己粘贴回去）。
+**不要调用任何工具去试探，也不要换工具、换写法重试**——档位限制对所有工具一视同仁，试探只会白白失败。
+
+- 命令分三类：禁止清单里的命令一律不执行（人工也不能放行）；只读白名单命令可直接跑；能执行代码或改动仓库的命令会先向用户请示。
+- 工具结果里若写着「用户拒绝了」或「档位限制」，那是最终结论，别再试第二次。
+- 档位只能由用户在输入框上方切换，你不能自己放宽。`;
+}
+
+export function buildSystemMessages(
+  phase: Phase,
+  tools: Tool[],
+  workspace?: string | null,
+  access: AccessLevel = DEFAULT_ACCESS,
+  hidden: string[] = []
+): ChatMessage[] {
   const base = phase === 'create' ? createPrompt : workPrompt(tools, workspace);
-  return [{ role: 'system', content: base }];
+  return [{ role: 'system', content: `${accessNote(access, hidden)}\n\n${base}` }];
 }

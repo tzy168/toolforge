@@ -2,12 +2,12 @@ import vm from 'node:vm';
 import { execFile } from 'node:child_process';
 import { renderDeep, renderString, extractPath, type Scope } from '../core/template.js';
 import { assertNet, execAllowed, pickEnv } from '../core/permissions.js';
+import { classifyCommand } from '../core/policy.js';
 import type { DeclarativeContext, Json, Tool } from '../types.js';
 
 // 声明式执行器：八成工具不需要写代码，走这里。
 // 宿主全程代理 IO，工具本身碰不到网络与文件系统。
-
-const SAFE_BINS = new Set(['node', 'git', 'echo', 'ls', 'dir', 'cat', 'curl', 'rg', 'grep', 'python', 'python3']);
+// 命令的黑白名单在 core/policy.ts 一份，这里只做二次校验，不另立一套规则。
 
 /** 需要手动逐跳校验域名的重定向状态码 */
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
@@ -21,7 +21,7 @@ export async function runDeclarative(tool: Tool, input: Json, ctx: DeclarativeCo
     case 'transform':
       return runTransform(tool, input);
     case 'shell':
-      return runShell(tool, scope);
+      return runShell(tool, scope, ctx);
     case 'compose':
       return runCompose(tool, scope, ctx);
     default:
@@ -118,23 +118,34 @@ function runTransform(tool: Tool, input: Json): unknown {
   return (context as Record<string, unknown>).__result;
 }
 
-function runShell(tool: Tool, scope: Scope): Promise<{ stdout: string; stderr: string }> {
+function runShell(tool: Tool, scope: Scope, ctx: DeclarativeContext): Promise<{ stdout: string; stderr: string }> {
   execAllowed(tool);
   const impl = tool.impl;
   const cmd = renderString(impl.command ?? '', scope).trim();
   const bin = cmd.split(/\s+/)[0] ?? '';
-  if (!SAFE_BINS.has(bin)) {
-    throw new Error(`命令 ${bin} 不在白名单内（${[...SAFE_BINS].join(', ')}）`);
+  const args = (impl.args || []).map((a) => renderString(a, scope));
+
+  // 二次校验：结论必须与闸门一致。绕过 executeTool 直接调执行器时，
+  // commandApproved 拿不到，需确认的命令就落不下去。
+  const verdict = classifyCommand(bin, args, impl.cwd ?? '', ctx.access ?? 'full');
+  if (verdict.decision === 'deny') throw new Error(`命令被禁止：${verdict.reason}`);
+  if (verdict.decision === 'confirm' && !ctx.commandApproved) {
+    throw new Error('这条命令需要人工确认，请经 executeTool 调用');
   }
   if (/[|&;<>$`]/.test(cmd)) {
     throw new Error('命令含 shell 元字符，已拒绝执行');
   }
-  const args = (impl.args || []).map((a) => renderString(a, scope));
   return new Promise((resolve, reject) => {
     execFile(
       bin,
       args,
-      { timeout: impl.timeoutMs ?? 30000, cwd: impl.cwd || undefined, env: pickEnv(tool) },
+      {
+        timeout: impl.timeoutMs ?? 30000,
+        cwd: impl.cwd || undefined,
+        // execFile 传 env 会替换整个环境：只给声明过的键会让 Windows 连 PATH 都没有，
+        // 明明放行的命令也找不到可执行文件。与 script.ts 的 childEnv 用同一套最小环境。
+        env: { PATH: process.env.PATH || '', SYSTEMROOT: process.env.SYSTEMROOT || '', ...pickEnv(tool) },
+      },
       (err, stdout, stderr) => {
         if (err) return reject(new Error(`${err.message}${stderr ? ' | ' + stderr.slice(0, 300) : ''}`));
         resolve({ stdout: stdout.slice(0, 100000), stderr: stderr.slice(0, 4000) });

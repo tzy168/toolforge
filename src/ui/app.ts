@@ -48,6 +48,18 @@ interface ProviderView {
   custom: boolean;
 }
 
+type AccessLevel = 'full' | 'workspace' | 'readonly';
+
+interface ApprovalRequest {
+  id: string;
+  tool: string;
+  action: string;
+  reason: string;
+  level: AccessLevel;
+  grantKey: string;
+  at: string;
+}
+
 interface ForgeState {
   home: string;
   model: string;
@@ -61,6 +73,7 @@ interface ForgeState {
   mcp: { available: boolean; status: Record<string, string>; count: number };
   sandbox: { probed: boolean; flag: string | null };
   depPolicy: { allowUnvettedDeps: boolean; origin: string; sharedDepsRoot: string | null; whitelist: string[] };
+  access: { level: AccessLevel; pending: ApprovalRequest[] };
 }
 
 type Envelope<T> = { ok: true; data: T } | { ok: false; error: string };
@@ -78,6 +91,10 @@ interface EventPayload {
   reasoning?: string;
   step?: number;
   toolCount?: number;
+  /** human-in-loop：待确认 / 已收尾的授权请求 */
+  approval?: ApprovalRequest;
+  decision?: string;
+  timedOut?: boolean;
 }
 
 interface Bridge {
@@ -87,6 +104,7 @@ interface Bridge {
     phase: string;
     history: Array<{ role: string; content: string }>;
     workspace?: string | null;
+    access?: AccessLevel;
   }) => Promise<
     Envelope<{ reply: string; aborted?: boolean; usage?: { prompt: number; hit: number; miss: number; completion: number } }>
   >;
@@ -98,6 +116,10 @@ interface Bridge {
   setEnabled: (id: string, enabled: boolean) => Promise<Envelope<unknown>>;
   /** 开关「联网安装白名单外依赖」。这是用户授权动作，必须由人点 */
   setAllowUnvettedDeps: (on: boolean) => Promise<Envelope<unknown>>;
+  /** 把 human-in-loop 的选择送回主进程，执行闸门会把它回灌给模型 */
+  decideApproval: (id: string, decision: string) => Promise<Envelope<{ ok: boolean }>>;
+  /** 切换访问档位（落 settings.json + 审计） */
+  setAccess: (level: AccessLevel) => Promise<Envelope<unknown>>;
   saveProvider: (p: Partial<ProviderView> & { apiKey?: string }) => Promise<Envelope<unknown>>;
   removeProvider: (id: string) => Promise<Envelope<unknown>>;
   setActiveProvider: (id: string | null) => Promise<Envelope<unknown>>;
@@ -234,6 +256,8 @@ let renderQueued = false;
  * 新点「新任务」会重置为 null —— 那才是真正的空白。
  */
 let draftWorkspace: TaskWorkspace = null;
+/** 「还没发出第一条消息」时的草稿档位；每个任务各存各的，切任务不会串 */
+let draftAccess: AccessLevel = 'full';
 
 /* ---------------- 任务（每段对话一条记录） ---------------- */
 
@@ -253,6 +277,8 @@ interface Task {
   at: number;
   /** 老数据没有这个字段，读出来是 undefined，按"未选"处理 */
   workspace?: TaskWorkspace;
+  /** 老任务没有档位字段，按完全访问处理 */
+  access?: AccessLevel;
   /**
    * 最后一轮的过程序列：思考、正文、工具按当时产出的顺序。
    * 只留最后一轮（每轮对话都会覆盖），重开任务时按原位回放。
@@ -277,6 +303,10 @@ const HISTORY_CHARS = 60000;
 
 function taskWorkspace(t: Task): TaskWorkspace {
   return t.workspace ?? null;
+}
+
+function taskAccess(t: Task): AccessLevel {
+  return t.access ?? 'full';
 }
 
 // 任务只是本地对话记录，存在渲染层即可，不进主进程仓库
@@ -317,8 +347,9 @@ function ensureTask(firstMessage: string): Task {
     phase,
     history: [],
     at: Date.now(),
-    // 新任务继承输入框上方当前选中的工作区
+    // 新任务继承输入框上方当前选中的工作区与权限档位
     workspace: draftWorkspace,
+    access: draftAccess,
   };
   tasks.unshift(task);
   activeId = task.id;
@@ -957,7 +988,9 @@ function openTask(id: string | null): void {
   // 每个任务记着自己的模式与工作区，切回来不用重选
   setPhase(task?.phase ?? 'work');
   if (task) draftWorkspace = taskWorkspace(task);
+  if (task) draftAccess = taskAccess(task);
   renderWorkspace(task ? taskWorkspace(task) : draftWorkspace);
+  renderAccess(task ? taskAccess(task) : draftAccess);
   renderTasks();
   renderHistory(task);
   showView('chat');
@@ -972,6 +1005,11 @@ async function refresh(): Promise<void> {
   if (!res.ok) return;
   const s = res.data;
   const live = s.tools.filter((t) => t.status !== 'rejected');
+  // 没有活动任务时，草稿档位跟随主进程持久化的值；有任务则以任务自己存的为准
+  if (!currentTask()) {
+    draftAccess = s.access?.level ?? 'full';
+    renderAccess(draftAccess);
+  }
 
   $<HTMLSpanElement>('#toolCount').textContent = String(live.filter((t) => t.status !== 'pending').length);
   $<HTMLSpanElement>('#pendingCount').textContent = String(s.pending.length);
@@ -1078,6 +1116,61 @@ function renderWorkspace(ws: TaskWorkspace): void {
       : ws === 'general'
         ? '通用工作区：不绑定文件夹'
         : '本任务还没选工作区，点击选择';
+}
+
+/* ---------------- 访问档位与 human-in-loop ---------------- */
+
+function renderAccess(level: AccessLevel): void {
+  const label: Record<AccessLevel, string> = {
+    full: '允许完全访问',
+    workspace: '工作区内修改',
+    readonly: '仅可查看',
+  };
+  const title: Record<AccessLevel, string> = {
+    full: '按工具声明的能力执行；命令仍按黑白名单分级并请示',
+    workspace: '写入只能落在选中的项目目录，命令执行要逐次确认',
+    readonly: '只看不改：禁写文件、禁执行命令、禁写类网络请求',
+  };
+  const chip = $<HTMLButtonElement>('#accessPick');
+  chip.dataset.level = level;
+  chip.title = title[level];
+  $<HTMLSpanElement>('#accessName').textContent = label[level];
+  document.querySelectorAll<HTMLElement>('#accessMenu .ws-option').forEach((opt) => {
+    opt.classList.toggle('active', opt.dataset.access === level);
+  });
+}
+
+function applyAccess(level: AccessLevel): void {
+  draftAccess = level;
+  const task = currentTask();
+  if (task) task.access = level;
+  saveTasks();
+  renderAccess(level);
+  // 落 settings.json + 审计；chat() 每轮还会按任务再传一次，切任务太快也不会拿错档位
+  void window.tf?.setAccess(level);
+}
+
+let pendingApprovalId: string | null = null;
+
+function showApproval(req: ApprovalRequest): void {
+  pendingApprovalId = req.id;
+  $<HTMLElement>('#approvalTitle').textContent = `需要你确认：${req.tool}`;
+  $<HTMLElement>('#approvalDesc').textContent = `${req.action}\n理由：${req.reason}`;
+  $<HTMLElement>('#approvalBar').hidden = false;
+}
+
+function hideApproval(id?: string): void {
+  // 超时收尾的事件可能晚于下一条请求，只关掉当前显示的那一条
+  if (id && id !== pendingApprovalId) return;
+  pendingApprovalId = null;
+  $<HTMLElement>('#approvalBar').hidden = true;
+}
+
+async function decideApproval(decision: string): Promise<void> {
+  const id = pendingApprovalId;
+  if (!id) return;
+  hideApproval();
+  await window.tf?.decideApproval(id, decision);
 }
 
 /* ---------------- 工具仓库筛选：等级 tab + 名称搜索 ---------------- */
@@ -2240,6 +2333,8 @@ async function send(text: string): Promise<void> {
       history: task.history,
       // 'general' 与 null 对后端都意味着「不绑定目录」，具体路径才传下去
       workspace: typeof task.workspace === 'string' ? task.workspace : null,
+      // 档位按轮传入，和工作区一样不靠全局状态，切任务时不会串
+      access: taskAccess(task),
     });
     if (res.ok) {
       // 最终文本以返回值收尾，覆盖流式过程中可能被丢弃的尾部碎片
@@ -2426,7 +2521,7 @@ $<HTMLSpanElement>('#homePath').addEventListener('click', () => window.tf?.openH
 /* ---------------- 输入区下拉：工作区 / 模型 ---------------- */
 
 /**
- * 两个下拉共用一套开合逻辑。
+ * 工作区 / 权限档位 / 模型三个下拉共用一套开合逻辑。
  *
  * 以前只有工作区一个菜单，逻辑直接写在按钮上；模型也换成下拉之后，
  * 再各写一份就会出现「打开模型菜单时工作区那个还开着」。这里收成一对函数。
@@ -2437,9 +2532,11 @@ function menuOf(chip: HTMLButtonElement, menu: HTMLElement): { chip: HTMLButtonE
 
 const wsPick = $<HTMLButtonElement>('#wsPick');
 const wsMenu = $<HTMLDivElement>('#wsMenu');
+const accessPick = $<HTMLButtonElement>('#accessPick');
+const accessMenu = $<HTMLDivElement>('#accessMenu');
 const modelPick = $<HTMLButtonElement>('#modelPick');
 const modelMenu = $<HTMLDivElement>('#modelMenu');
-const menus = [menuOf(wsPick, wsMenu), menuOf(modelPick, modelMenu)];
+const menus = [menuOf(wsPick, wsMenu), menuOf(accessPick, accessMenu), menuOf(modelPick, modelMenu)];
 
 /** 开关某一组；开的时候把另一组关掉，永远只会有一个浮层挡着输入框 */
 function setMenuOpen(target: { chip: HTMLButtonElement; menu: HTMLElement } | null, open: boolean): void {
@@ -2511,6 +2608,20 @@ wsMenu.addEventListener('click', async (e) => {
   }
 });
 
+// 切权限档位：写进当前任务，并同步给主进程持久化
+accessMenu.addEventListener('click', (e) => {
+  const opt = (e.target as HTMLElement).closest<HTMLElement>('.ws-option');
+  const level = opt?.dataset.access as AccessLevel | undefined;
+  setMenuOpen(null, false);
+  if (!level) return;
+  applyAccess(level);
+});
+
+// 人工确认条：三个按钮只负责把选择送回去，拒绝文案由执行闸门生成并回灌模型
+$<HTMLButtonElement>('#approvalOnce').addEventListener('click', () => void decideApproval('allow_once'));
+$<HTMLButtonElement>('#approvalAlways').addEventListener('click', () => void decideApproval('allow_always'));
+$<HTMLButtonElement>('#approvalDeny').addEventListener('click', () => void decideApproval('deny'));
+
 // 切模型：只切选中的那家，Key / Base URL 仍归设置页
 modelMenu.addEventListener('click', async (e) => {
   const opt = (e.target as HTMLElement).closest<HTMLElement>('.ws-option');
@@ -2559,6 +2670,15 @@ document.addEventListener('keydown', (e) => {
 
 if (window.tf) {
   window.tf.onEvent((event) => {
+    // 授权事件即使切走了任务也要处理：确认条不该因为 liveRun 不在场就一直挂着
+    if (event.type === 'approval_request' && event.approval) {
+      showApproval(event.approval);
+      return;
+    }
+    if (event.type === 'approval_resolved') {
+      hideApproval(event.approval?.id);
+      return;
+    }
     if (!liveRun) return;
     // 用户可能已经切到别的任务；此时数据照收，但界面不碰
     const onScreen = activeId === liveRun.taskId;

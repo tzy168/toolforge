@@ -37,6 +37,19 @@
 
         <div class="chat" id="chat"></div>
 
+        <!-- human-in-loop：模型要跑需确认的命令时挂在这里等，人的选择回灌给模型 -->
+        <div id="approvalBar" class="approval-bar" hidden>
+          <div class="approval-copy">
+            <strong id="approvalTitle">需要你确认</strong>
+            <span id="approvalDesc"></span>
+          </div>
+          <div class="approval-acts">
+            <button id="approvalOnce" class="ghost" type="button">允许一次</button>
+            <button id="approvalAlways" class="ghost" type="button">本会话允许</button>
+            <button id="approvalDeny" class="ghost solid" type="button">拒绝</button>
+          </div>
+        </div>
+
         <div class="composer-wrap">
           <form class="composer" id="composer">
             <textarea id="input" rows="1" placeholder="说说你要做什么…（Shift + Enter 换行）"></textarea>
@@ -67,6 +80,26 @@
               </div>
 
               <div class="composer-actions">
+                <div class="access-bar">
+                  <button id="accessPick" class="cb-chip access-chip" type="button" title="访问权限档位" aria-haspopup="true" aria-expanded="false">
+                    <span id="accessName">允许完全访问</span>
+                    <span class="cb-caret" aria-hidden="true">▾</span>
+                  </button>
+                  <div id="accessMenu" class="ws-menu access-menu" hidden>
+                    <button class="ws-option" data-access="full" type="button">
+                      <span class="ws-opt-name">允许完全访问</span>
+                      <span class="ws-opt-desc">按工具声明的能力执行，命令仍需按黑白名单确认</span>
+                    </button>
+                    <button class="ws-option" data-access="workspace" type="button">
+                      <span class="ws-opt-name">工作区内修改</span>
+                      <span class="ws-opt-desc">写入只能落在选中的项目目录，命令执行要逐次确认</span>
+                    </button>
+                    <button class="ws-option" data-access="readonly" type="button">
+                      <span class="ws-opt-name">仅可查看</span>
+                      <span class="ws-opt-desc">禁写文件、禁执行命令、禁写类网络请求</span>
+                    </button>
+                  </div>
+                </div>
                 <div class="model-bar">
                   <button id="modelPick" class="cb-chip model-chip" type="button" title="切换模型" aria-haspopup="true" aria-expanded="false">
                     <span id="modelChipName">未配置模型</span>

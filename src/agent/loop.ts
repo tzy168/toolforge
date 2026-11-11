@@ -285,7 +285,11 @@ export async function runLoop({
       if (parseError) {
         out = { ok: false, error: `参数不是合法 JSON：${parseError}`, ms: 0 };
       } else if (!available.some((t) => t.tool.name === name)) {
-        out = { ok: false, error: `没有名为 ${name} 的工具。可调 list_tools 看看有哪些。`, ms: 0 };
+        out = {
+          ok: false,
+          error: `没有名为 ${name} 的工具，或它已被当前权限档位隐藏。可调 list_tools 看当前可用工具；若确需它，请用户切换权限档位，不要换工具重试。`,
+          ms: 0,
+        };
       } else {
         out = await runTool(name, args);
       }

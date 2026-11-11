@@ -104,6 +104,16 @@ pnpm installer        # 单文件安装包
 
 定级按能力走，不按来源：`L0` 无权限 / `L1` 只读网络或沙箱跑代码 / `L2` 写盘或读密钥 → 转人工 / `L3` 可执行命令或静态扫描命中高危 → 转人工。改 `grade()` 会同时影响自动放行策略，改之前先看 `test/loop.test.ts` 里的定级用例。
 
+## 访问档位与命令分级（human-in-loop）
+
+- 三级档位 `full / workspace / readonly` 在 `src/core/policy.ts`，按轮由 `chat({ access })` 传入（与 workspace 同理，别改成只靠全局开关）。`effectivePermissions()` **只收窄不放宽**，落盘规格不变；`readonly` 另在 `ToolForge.runTool` 里挡住 `create_tool` / `manage_tool` 这些不经 `executeTool` 的元工具。
+- 命令分三类：`DENY_BINS` 是硬红线（人也不能放行）、`ALLOW_BINS` 只读命令直接跑、`CONFIRM_BINS` 需人工确认；清单外默认拒绝。`workspace` 档下 `impl.cwd` 必须落在工作区。判定收在 `classifyCommand()` 一处，宿主闸门与执行器共用同一份结论，执行器靠 `commandApproved` 做二次校验。
+- `src/core/approval.ts` 挂起 `executeTool`，发 `approval_request` 事件，等界面经 `tf:decideApproval` 回传；超时与暂停都按拒绝收尾。**人的决定必须经 `executeTool` 的返回值变成 `loop.ts` 里那条 `role=tool` 消息**——只改状态不回话，模型会反复重试同一条命令。
+- **权限要前置到「选工具之前」，不能只做执行时拒绝**：`chat()` 的 `toolProvider` 与 `buildSystemMessages` 都过 `filterTools()`；`selectTools` 的 `always` 名单要跟着摘掉 `create_tool`，否则又被强行塞回 schema。`MetaContext.allTools()` 同样给过滤后的集合，否则 `list_tools` / `tool_search` 把全量仓库报给模型，它又会去试被拦的那些；`list_tools` 对隐藏工具标 `blockedByAccess`。
+- 系统提示词里 `accessNote` 必须排在**最前面**，并点名被隐藏的工具、写明「不要调用任何工具去试探」。拒绝文案也要说「档位限制，换任何工具重试都不会成功」——只说「不行」会诱使模型换工具连试八次才问人。
+- CLI 没有确认条，构造时注入 `approvalResponder` 自动拒绝并打印；桌面端不传，走界面确认条。测试用同一入口注入自定义应答。
+- 动输入区或 `openTask` 后跑 `pnpm verify:switch`；动工具仓库筛选跑 `pnpm verify:toolfilter`。
+
 ## 状态机
 
 ```

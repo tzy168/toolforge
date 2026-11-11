@@ -8,14 +8,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { dirs, toolDir } from '../core/paths.js';
 import { installToolDeps, planSharedDeps, readDepPolicy, toDepRecord, type DepInstallReport } from '../core/deps.js';
-import type { Json, JsonSchema, Tool, ToolImpl, ToolResult, Permissions } from '../types.js';
+import type { AccessLevel, Json, JsonSchema, Tool, ToolImpl, ToolResult, Permissions } from '../types.js';
 
 // 元工具：Agent 用来「看仓库、找工具、造工具」的那几件。
 // 它们本身就是 Tool —— 所以核心循环永远不必为「自我扩展」改动。
 
 export interface MetaContext {
   sessionId: string | null;
+  /** 已按当前档位过滤：自省工具不能把被隐藏的工具又报给模型 */
   allTools: () => Tool[];
+  access: AccessLevel;
+  hiddenTools: () => string[];
   runTool: (name: string, args: Json, depth?: number) => Promise<ToolResult>;
 }
 
@@ -113,6 +116,7 @@ export const metaToolDefs: MetaDef[] = [
       // 恰恰是查工具时最常问的问题。所以全量清单直接从 store 取，再逐件标上可否调用。
       const callable = ctx.allTools();
       const callableNames = new Set(callable.map((t) => t.name));
+      const hidden = new Set(ctx.hiddenTools());
       const { tools: repo, broken } = store.list({ includeBroken: true });
 
       const row = (t: Tool, isCallable: boolean) => ({
@@ -120,7 +124,8 @@ export const metaToolDefs: MetaDef[] = [
         kind: t.kind,
         trust: t.trust,
         status: t.status,
-        callable: isCallable,
+        callable: isCallable && !hidden.has(t.name),
+        blockedByAccess: hidden.has(t.name),
         description: t.description.slice(0, 80),
       });
 
@@ -136,6 +141,10 @@ export const metaToolDefs: MetaDef[] = [
       return JSON.stringify({
         total: rows.length,
         callable: storeRows.filter((r) => r.callable).length + metas.length,
+        access: { level: ctx.access, hiddenCount: hidden.size },
+        hint: hidden.size
+          ? 'blockedByAccess=true 的工具因当前权限档位不可用，不要调用、也不要另造一件绕过；需要时请用户切换档位。'
+          : undefined,
         repo: { total: storeRows.length, byStatus, broken: broken.map((b) => b.id) },
         tools: rows,
       });
@@ -156,7 +165,14 @@ export const metaToolDefs: MetaDef[] = [
     async handler(args, ctx) {
       const all = ctx.allTools();
       const picked = selectTools(all, String(args.query ?? ''), { limit: Math.min(Number(args.limit) || 8, 20) });
-      return JSON.stringify({ total: all.length, matched: indexOf(picked) });
+      return JSON.stringify({
+        total: all.length,
+        access: ctx.access,
+        matched: indexOf(picked),
+        hint: ctx.hiddenTools().length
+          ? '结果只含当前权限档位可用的工具；被隐藏的工具无法调用，需要时请用户切换档位。'
+          : undefined,
+      });
     },
   },
   {
@@ -190,19 +206,22 @@ export const metaToolDefs: MetaDef[] = [
     async handler(args, ctx) {
       const action = String(args.action ?? '');
       const key = String(args.tool ?? '').trim();
+      const hidden = new Set(ctx.hiddenTools());
 
       if (action === 'list') {
         const { tools: repo, broken } = store.list({ includeBroken: true });
         return JSON.stringify({
           total: repo.length,
           broken: broken.map((b) => b.id),
+          access: { level: ctx.access, hiddenCount: hidden.size },
           tools: repo.map((t) => ({
             name: t.name,
             id: t.id,
             kind: t.kind,
             trust: t.trust,
             status: t.status,
-            callable: isUsable(t, ctx.sessionId),
+            callable: isUsable(t, ctx.sessionId) && !hidden.has(t.name),
+            blockedByAccess: hidden.has(t.name),
           })),
         });
       }
@@ -226,7 +245,8 @@ export const metaToolDefs: MetaDef[] = [
           version: target.version,
           trust: target.trust,
           status: target.status,
-          callable: isUsable(target, ctx.sessionId),
+          callable: isUsable(target, ctx.sessionId) && !hidden.has(target.name),
+          blockedByAccess: hidden.has(target.name),
           description: target.description,
           permissions: describePermissions(target.permissions),
           examples: (target.examples || []).length,

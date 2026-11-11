@@ -4,6 +4,27 @@ export type ToolKind = 'http' | 'transform' | 'shell' | 'script' | 'compose' | '
 export type ToolStatus = 'active' | 'pending' | 'untested' | 'rejected' | 'disabled';
 export type TrustLevel = 'L0' | 'L1' | 'L2' | 'L3';
 
+/**
+ * 用户给本轮任务定的访问档位。与工具声明取交集，只会收窄、不会放宽。
+ * full=按声明执行  workspace=只能写工作区  readonly=只看不改
+ */
+export type AccessLevel = 'full' | 'workspace' | 'readonly';
+
+/** 一次 human-in-loop 确认的结果 */
+export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
+
+/** 挂起中的授权请求。只带给人看的信息，不含任何可执行路径 */
+export interface ApprovalRequest {
+  id: string;
+  tool: string;
+  action: string;
+  reason: string;
+  level: AccessLevel;
+  /** 「本会话允许」的记忆键 */
+  grantKey: string;
+  at: string;
+}
+
 export type JsonSchema = Record<string, unknown>;
 export type Json = Record<string, unknown>;
 
@@ -166,6 +187,10 @@ export interface Grade {
 export interface DeclarativeContext {
   sessionId: string | null;
   run: (name: string, args: Json) => Promise<unknown>;
+  /** 本轮访问档位；执行器据此做二次校验，不直接改权限 */
+  access?: AccessLevel;
+  /** 需确认的命令已由 executeTool 拿到人工许可，执行器才准放行 */
+  commandApproved?: boolean;
 }
 
 /** 跑工具的调度上下文 */
@@ -175,10 +200,14 @@ export interface ExecuteOptions {
   runner?: ((name: string, args: Json, depth?: number) => Promise<ToolResult>) | null;
   /** 仅供 create_tool 跑自带用例时开口：用例要在 untested 状态下执行，模型侧不能调 */
   allowUntested?: boolean;
+  /** 本轮访问档位；不传时读全局设置 */
+  access?: AccessLevel;
+  /** 暂停一轮时把挂起的授权请求按拒绝收尾 */
+  signal?: AbortSignal;
 }
 
 export interface AgentEvent {
-  type: 'step' | 'assistant' | 'tool_call' | 'tool_result' | 'delta' | 'reasoning';
+  type: 'step' | 'assistant' | 'tool_call' | 'tool_result' | 'delta' | 'reasoning' | 'approval_request' | 'approval_resolved';
   step?: number;
   toolCount?: number;
   content?: string;
@@ -192,6 +221,12 @@ export interface AgentEvent {
   delta?: string;
   /** 推理增量：type=reasoning 时是本片思考内容，前端追加到可折叠的思考块里 */
   reasoning?: string;
+  /** human-in-loop：待确认 / 已收尾的授权请求 */
+  approval?: ApprovalRequest;
+  /** type=approval_resolved 时人的选择 */
+  decision?: ApprovalDecision;
+  /** true 表示这次拒绝来自等待超时，不是人点了拒绝 */
+  timedOut?: boolean;
 }
 
 /** 给 UI 的瘦身版 */

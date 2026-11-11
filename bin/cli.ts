@@ -28,7 +28,8 @@ function storeId(tf: ToolForge, name: string): string {
 
 async function selftest(): Promise<void> {
   console.log('\n ToolForge 自检 — 走一遍「造工具」的完整链路\n');
-  const tf = new ToolForge();
+  // 自检没有界面可点，注入一个自动拒绝，免得万一碰到需确认的命令就干等超时
+  const tf = new ToolForge({ approvalResponder: () => 'deny' });
   await tf.init({ connectMcp: false });
   let pass = 0;
   let fail = 0;
@@ -169,12 +170,23 @@ async function selftest(): Promise<void> {
 }
 
 async function repl(): Promise<void> {
-  const tf = new ToolForge({ onEvent: renderEvent });
+  // 命令行没有可点的确认条：把请示打印出来并按拒绝处理，结果照样回灌模型。
+  // 想真正人工放行请用桌面端（pnpm start）。
+  const tf = new ToolForge({
+    onEvent: renderEvent,
+    approvalResponder: (req) => {
+      console.log(`\n   ⚠ 需要人工授权：${req.action}`);
+      console.log(`     理由：${req.reason}`);
+      console.log('     命令行不弹确认，本次按拒绝处理；需要放行请用桌面端。\n');
+      return 'deny';
+    },
+  });
   await tf.init();
   let phase: 'work' | 'create' = 'work';
   console.log('\n ToolForge —— 创建你自己的 Agent');
   console.log(` 仓库 ${tf.state().home}`);
-  console.log(' /work 切换干活   /create 切换造工具   /tools 看仓库   /approve <id>   /exit\n');
+  console.log(' /work 切换干活   /create 切换造工具   /tools 看仓库   /approve <id>');
+  console.log(' /access <readonly|workspace|full> 切换权限档位   /exit\n');
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
@@ -197,6 +209,11 @@ async function repl(): Promise<void> {
       if (text.startsWith('/approve ')) {
         tf.approve(text.slice(9).trim());
         console.log('   已放行');
+        return ask();
+      }
+      if (text.startsWith('/access ')) {
+        const st = tf.setAccessLevel(text.slice(8).trim() as never);
+        console.log(`   权限档位：${st.access.level}`);
         return ask();
       }
       try {

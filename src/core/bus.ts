@@ -1,6 +1,8 @@
 import { Ajv } from 'ajv';
 import { store, isUsable } from './store.js';
 import * as audit from './audit.js';
+import { accessDenies, classifyCommand, commandSummary, effectivePermissions, getAccessLevel } from './policy.js';
+import { requestApproval } from './approval.js';
 import { runDeclarative } from '../executors/declarative.js';
 import { runScript } from '../executors/script.js';
 import { callMcpTool } from '../mcp/client.js';
@@ -55,11 +57,13 @@ export function clampForModel(value: unknown): string {
 }
 
 /**
- * 唯一的执行入口：权限门 → 参数校验 → 沙箱 → 审计。
- * 任何 tool 都走这里，没有旁门。
+ * 唯一的执行入口：档位裁剪 → 命令分级 → 人工确认 → 参数校验 → 沙箱 → 审计。
+ * 任何 tool 都走这里，没有旁门。被拒绝的原因会原样回到模型，所以写清楚下一步该怎么改。
  */
 export async function executeTool(tool: Tool, args: Json = {}, opts: ExecuteOptions = {}): Promise<ToolResult> {
   const { sessionId = null, depth = 0, runner = null, allowUntested = false } = opts;
+  const level = opts.access ?? getAccessLevel();
+  const signal = opts.signal;
   const started = Date.now();
   let ok = false;
   let result: unknown;
@@ -68,20 +72,68 @@ export async function executeTool(tool: Tool, args: Json = {}, opts: ExecuteOpti
   try {
     if (depth > 5) throw new Error('工具组合层数过深（最多 5 层）');
 
-    const usable = isUsable(tool, sessionId, { allowUntested });
+    const denial = accessDenies(tool, level, args);
+    if (denial) throw new Error(denial);
+
+    // 命令分级与 human-in-loop 都收在闸门口：执行器只认 commandApproved 这个结果，
+    // 不自己弹确认，也不接受「绕过闸门直接调 runDeclarative」的调用。
+    let commandApproved = false;
+    if (tool.kind === 'shell') {
+      const cmdArgs = (tool.impl.args || []).map(String);
+      const verdict = classifyCommand(tool.impl.command ?? '', cmdArgs, tool.impl.cwd ?? '', level);
+      const summary = commandSummary(tool.impl.command ?? '', cmdArgs);
+      audit.append({ type: 'command_classify', tool: tool.name, bin: verdict.bin, decision: verdict.decision, level });
+
+      if (verdict.decision === 'deny') {
+        throw new Error(
+          `命令被禁止：${verdict.reason}。禁止清单不接受人工放行；请改用只读工具，或换一条在允许清单内的命令。`
+        );
+      }
+      if (verdict.decision === 'confirm') {
+        const answer = await requestApproval({
+          tool: tool.name,
+          action: summary,
+          reason: verdict.reason,
+          level,
+          grantKey: `${tool.name}:${verdict.bin}:${cmdArgs.join(' ')}`,
+          signal,
+        });
+        audit.append({
+          type: 'approval_decision',
+          tool: tool.name,
+          decision: answer.decision,
+          timedOut: answer.timedOut,
+          action: audit.summarize(summary, 160),
+        });
+        if (answer.decision === 'deny') {
+          throw new Error(
+            answer.timedOut
+              ? '等待人工确认超时，这条命令按拒绝处理，未执行。不要原样重试；请改用只读方式，或请用户重新发起并授权。'
+              : `用户拒绝了这条命令（${summary}）。这是人的最终决定，不要换写法重试同一条命令；请改用只读方式完成任务，或向用户说明需要什么授权。`
+          );
+        }
+        commandApproved = true;
+      }
+    }
+
+    // 执行器只拿到收窄后的权限视图。落盘规格不变，下次换档位重新计算。
+    const scoped: Tool = { ...tool, permissions: effectivePermissions(tool, level) };
+    const usable = isUsable(scoped, sessionId, { allowUntested });
     if (!usable) {
       throw new Error(`工具 ${tool.name} 尚未放行（当前状态 ${tool.status}），只有创建它的那次会话能临时调用`);
     }
 
-    validateArgs(tool, args);
+    validateArgs(scoped, args);
 
     if (tool.kind === 'mcp') {
-      result = await callMcpTool(tool, args);
+      result = await callMcpTool(scoped, args);
     } else if (tool.kind === 'script') {
-      result = await runScript(tool, args);
+      result = await runScript(scoped, args);
     } else {
-      result = await runDeclarative(tool, args, {
+      result = await runDeclarative(scoped, args, {
         sessionId,
+        access: level,
+        commandApproved,
         run: async (name, a) => {
           if (!runner) throw new Error('组合工具缺少调度器');
           const out = await runner(name, a, depth + 1);

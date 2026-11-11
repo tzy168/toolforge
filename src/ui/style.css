@@ -410,6 +410,42 @@ body {
 .ws-opt-name { display: block; font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--ink); }
 .ws-opt-desc { display: block; font-size: var(--fs-xs); color: var(--faint); margin-top: 3px; line-height: 1.6; }
 
+/* 权限档位：只用描边色区分三档，不抢输入框的视觉重心 */
+.access-bar { position: relative; min-width: 0; }
+.access-menu { left: auto; right: 0; min-width: 300px; }
+.access-chip { border-color: var(--line); }
+.access-chip[data-level='readonly'] { color: var(--green); border-color: var(--green); }
+.access-chip[data-level='workspace'] { color: var(--amber); border-color: var(--amber); }
+.access-chip[data-level='full'] { color: var(--muted); }
+
+/* human-in-loop 确认条：贴在输入框上方，朱红线提示这是一次需要人点头的操作 */
+.approval-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: var(--chat-width);
+  max-width: calc(100% - 32px);
+  margin: 0 auto 8px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--red);
+  border-left: 3px solid var(--red);
+  border-radius: 10px;
+}
+.approval-bar[hidden] { display: none; }
+.approval-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.approval-copy strong { font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--ink); }
+.approval-copy span {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 72px;
+  overflow: auto;
+}
+.approval-acts { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
 /* 页签退成文字 + 一道朱红短线，不再套胶囊底与投影 */
 .tabs { display: flex; align-items: center; gap: 20px; flex: 0 0 auto; }
 .tab {

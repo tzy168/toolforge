@@ -311,6 +311,14 @@ ipcMain.handle('tf:remove', guard((_e: unknown, id: string) => forge!.removeTool
 ipcMain.handle('tf:setEnabled', guard((_e: unknown, id: string, enabled: boolean) => forge!.setEnabled(id, enabled)));
 // 联网装依赖的总开关：这是一次显式授权，单独走一条 IPC，别混进「保存配置」
 ipcMain.handle('tf:setDepPolicy', guard((_e: unknown, allow: boolean) => forge!.setAllowUnvettedDeps(Boolean(allow))));
+// human-in-loop 与访问档位：都是人的决定，各走一条独立 IPC
+ipcMain.handle(
+  'tf:decideApproval',
+  guard((_e: unknown, id: string, decision: 'allow_once' | 'allow_always' | 'deny') =>
+    forge!.decideApproval(String(id), decision)
+  )
+);
+ipcMain.handle('tf:setAccess', guard((_e: unknown, level: string) => forge!.setAccessLevel(level as never)));
 ipcMain.handle('tf:saveProvider', guard((_e: unknown, p: unknown) => forge!.saveProvider(p as never)));
 ipcMain.handle('tf:removeProvider', guard((_e: unknown, id: string) => forge!.removeProvider(id)));
 ipcMain.handle('tf:setActiveProvider', guard((_e: unknown, id: string | null) => forge!.setActiveProvider(id)));
