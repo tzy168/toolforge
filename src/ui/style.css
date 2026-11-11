@@ -5,9 +5,17 @@
   --ink: #1a1a1d;
   --muted: #51514d;
   --faint: #6d6d67;
-  --line: #e6e5e0;
+  --line: #e9e8e3;
   --bg: #ffffff;
   --panel: #fbfbf9;
+  /* 质感令牌：分三层投影（贴边 / 悬浮 / 弹层），双层叠加比单层大模糊更"实"；
+     墨色带 0.0x 透明度，暖灰底上不发蓝。 */
+  --shadow-sm: 0 1px 2px rgba(26, 26, 29, 0.05), 0 0 0 1px rgba(26, 26, 29, 0.02);
+  --shadow-md: 0 1px 2px rgba(26, 26, 29, 0.04), 0 6px 20px -6px rgba(26, 26, 29, 0.1);
+  --shadow-lg: 0 2px 4px rgba(26, 26, 29, 0.04), 0 16px 40px -8px rgba(26, 26, 29, 0.16);
+  /* 墨色主按钮的渐变与顶部内高光：纯平色在大面积黑块上显"塑料" */
+  --ink-grad: linear-gradient(180deg, #2c2c31 0%, #1a1a1d 100%);
+  --ink-hi: inset 0 1px 0 rgba(255, 255, 255, 0.14);
   --red: #c8102e;
   /* 成功/警告是功能性语义色，压低饱和后只作点与边，不抢墨黑 + 朱红的主色 */
   --green: #3a6650;
@@ -64,7 +72,7 @@ body {
   flex: 0 0 240px;
   border-right: 1px solid var(--line);
   /* 侧栏保持一块干净的浅底：常驻飘动的极光会在余光里一直晃 */
-  background: var(--panel);
+  background: linear-gradient(180deg, #fbfbf9 0%, #f6f5f1 100%);
   display: flex;
   flex-direction: column;
   padding: 14px 0;
@@ -98,10 +106,11 @@ body {
 /* 品牌标记：静止的墨色小方块，不做常驻旋转 */
 .side-brand::before {
   content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  background: var(--ink);
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  /* 墨色方块右下角压一点朱红，品牌色在此露一次脸 */
+  background: linear-gradient(135deg, var(--ink) 55%, var(--red) 55%);
 }
 
 .icon-btn {
@@ -131,13 +140,14 @@ body {
   text-align: left;
   padding: 9px 11px;
   border: 1px solid var(--ink);
-  border-radius: 8px;
-  background: var(--ink);
+  border-radius: 10px;
+  background: var(--ink-grad);
+  box-shadow: var(--ink-hi), 0 2px 8px -2px rgba(26, 26, 29, 0.35);
   color: #fff;
   cursor: pointer;
-  transition: background var(--dur-1) var(--ease);
+  transition: box-shadow var(--dur-1) var(--ease), filter var(--dur-1) var(--ease);
 }
-.new-task:hover { background: #333338; }
+.new-task:hover { filter: brightness(1.18); }
 
 .task-list { flex: 1; overflow-y: auto; padding: 0 8px; }
 /* 侧栏的滚动条平时透明，指针进到列表里才浮出来，少点视觉噪音 */
@@ -189,8 +199,10 @@ body {
   pointer-events: none;
 }
 .task:hover { background: #f1f0ec; color: var(--ink); }
+/* 选中项浮成一张白卡：比"深一档灰底"更有层次，也不用靠颜色差辨认 */
 .task.active {
-  background: #eceae4;
+  background: #fff;
+  box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--line);
   color: var(--ink);
   font-weight: var(--fw-medium);
 }
@@ -282,7 +294,7 @@ body {
 .group-add:hover { color: var(--ink); background: #eceae4; }
 
 /* ---------- 主区 ---------- */
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; background: linear-gradient(180deg, #fff 0%, #fcfcfa 100%); }
 
 /* 侧栏收起时才出现的展开按钮。放在顶栏左侧的工作流里，
    不再绝对定位——绝对定位会压在工作目录按钮上。 */
@@ -321,11 +333,13 @@ body {
   width: 100%;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 18px;
-  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+  border-radius: 20px;
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease);
 }
-/* 聚焦时整个胶囊提亮，而不是只给 textarea 描边——这样「在跟谁说话」很清楚 */
-.composer:focus-within { border-color: #d6d4cc; box-shadow: 0 2px 16px rgba(23, 23, 26, 0.06); }
+/* 聚焦时整个胶囊提亮，而不是只给 textarea 描边——这样「在跟谁说话」很清楚。
+   外圈 3px 朱红淡晕是唯一的彩色提示，透明度压到 0.08 不刺眼。 */
+.composer:focus-within { border-color: #d3d1c9; box-shadow: var(--shadow-lg), 0 0 0 3px rgba(200, 16, 46, 0.08); }
 
 .composer-bar {
   display: flex;
@@ -385,8 +399,8 @@ body {
   padding: 5px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(23, 23, 26, 0.1);
+  border-radius: 14px;
+  box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -397,13 +411,14 @@ body {
 .ws-option {
   font-family: inherit;
   text-align: left;
-  padding: 8px 10px;
+  padding: 9px 11px;
   border: none;
-  border-radius: 7px;
+  border-radius: 9px;
   background: transparent;
   cursor: pointer;
+  transition: background var(--dur-1) var(--ease);
 }
-.ws-option:hover { background: var(--panel); }
+.ws-option:hover { background: #f5f4f0; }
 .ws-option[aria-disabled='true'] { opacity: 0.5; cursor: default; }
 .ws-option[aria-disabled='true']:hover { background: transparent; }
 .ws-option.active { background: #f3f2ee; }
@@ -471,6 +486,7 @@ body {
   right: 0;
   bottom: 0;
   height: 2px;
+  border-radius: 2px 2px 0 0;
   background: var(--red);
   opacity: 0;
   transition: opacity var(--dur-1) var(--ease);
@@ -520,7 +536,7 @@ body {
   cursor: pointer;
 }
 .nav-item:hover { background: #f1f0ec; color: var(--ink); }
-.nav-item.active { background: #eceae4; color: var(--ink); font-weight: var(--fw-medium); }
+.nav-item.active { background: #fff; box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--line); color: var(--ink); font-weight: var(--fw-medium); }
 
 /* 左下角的 fixed 设置按钮没了，底部不必再留 90px 空档 */
 .settings-panes { flex: 1; overflow-y: auto; padding: 28px; min-width: 0; }
@@ -899,17 +915,37 @@ body {
 .chat-inner { max-width: var(--chat-width); margin: 0 auto; padding: 0 28px; }
 
 
-.empty { text-align: center; margin-top: 14vh; color: var(--faint); position: relative; }
+.empty { text-align: center; margin-top: 14vh; color: var(--faint); position: relative; isolation: isolate; /* 让光晕的 z-index:-1 留在本容器内，不沉到 .main 底色之后 */ }
+/* 标题背后一团极淡的暖光，静态不动：给大片留白一个视觉重心 */
+.empty::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -90px;
+  width: 560px;
+  height: 320px;
+  transform: translateX(-50%);
+  background: radial-gradient(closest-side, rgba(200, 16, 46, 0.055), rgba(200, 16, 46, 0) 100%);
+  pointer-events: none;
+  z-index: -1;
+}
 /* 空状态只靠留白分层，不再铺网格：细线压在字后面会抢对焦 */
 /* 口号：整行一次淡入上移，200ms 落定。逐字错峰 + 模糊 + 高光三层叠起来
    要两秒才静，那是热闹不是灵动。 */
 .hero {
-  font-size: 38px;
-  font-weight: 600;
-  letter-spacing: -0.5px;
-  line-height: 1.25;
+  font-size: 44px;
+  font-weight: 700;
+  letter-spacing: -1.2px;
+  line-height: 1.2;
   margin: 0;
   font-family: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+  /* 墨色 → 暖灰的渐变字：高级感主要来自这种克制的明暗，而不是多一个颜色。
+     background-clip:text 在 Electron(Chromium) 里稳定；动画只动 transform/opacity，不冲突。 */
+  background: linear-gradient(180deg, #1a1a1d 30%, #77756d 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
   animation: enter-up var(--dur-2) var(--ease) both;
 }
 .hero-sub {
@@ -946,14 +982,15 @@ body {
   line-height: 1.65;
   color: var(--muted);
   text-align: left;
-  padding: 12px 14px;
+  padding: 14px 16px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 14px;
+  box-shadow: var(--shadow-sm);
   cursor: pointer;
-  transition: border-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+  transition: border-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease), transform var(--dur-2) var(--ease);
 }
-.quick-item:hover { color: var(--ink); border-color: var(--faint); background: var(--panel); }
+.quick-item:hover { color: var(--ink); border-color: #d6d4cc; box-shadow: var(--shadow-md); transform: translateY(-2px); }
 .quick-tag {
   display: block;
   font-size: var(--fs-xs);
@@ -979,10 +1016,11 @@ body {
 
 /* 用户消息：浅底无尖角，靠右对齐与底色分层，不做聊天气泡的小尾巴 */
 .msg-user {
-  background: var(--panel);
+  background: linear-gradient(180deg, #fbfbf9 0%, #f5f4f0 100%);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 12px 16px;
+  border-radius: 16px;
+  box-shadow: var(--shadow-sm);
+  padding: 12px 18px;
   font-size: var(--fs-lg);
   line-height: 1.8;
   white-space: pre-wrap;
@@ -1028,8 +1066,9 @@ body {
 .md pre {
   background: #fbfbf8;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 13px 15px;
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+  padding: 14px 16px;
   overflow-x: auto;
   margin: 0 0 12px;
 }
@@ -1137,10 +1176,11 @@ body {
   font-size: var(--fs-xs);
   font-family: ui-monospace, monospace;
   color: var(--muted);
-  padding: 5px 10px;
+  padding: 6px 12px;
   margin: 3px 0;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 9px;
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
   display: flex;
   align-items: baseline;
@@ -1494,7 +1534,10 @@ body {
   .thinking-label.label-in,
   .loader > span,
   .loader[data-kind='truck'] *,
+  .quick-item,
+  .act-btn,
   .tab::after { animation: none !important; transition: none !important; }
+  .quick-item:hover, .act-btn:hover:not(:disabled) { transform: none; }
   .task::before,
   .task-del,
   .group-add,
@@ -1540,17 +1583,19 @@ body {
   line-height: 1;
   border-radius: 50%;
   border: 1px solid var(--ink);
-  background: var(--ink);
+  background: var(--ink-grad);
+  box-shadow: var(--ink-hi), 0 2px 6px -1px rgba(26, 26, 29, 0.4);
   color: #fff;
   cursor: pointer;
   transition: transform var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease), opacity var(--dur-1) var(--ease), background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
-.act-btn:hover:not(:disabled) { box-shadow: 0 2px 10px rgba(23, 23, 26, 0.18); transform: translateY(-1px); }
-.act-btn:active:not(:disabled) { transform: translateY(0) scale(0.94); box-shadow: none; }
+.act-btn:hover:not(:disabled) { box-shadow: var(--ink-hi), 0 4px 12px -2px rgba(26, 26, 29, 0.45); transform: translateY(-1px); }
+.act-btn:active:not(:disabled) { transform: translateY(0) scale(0.94); box-shadow: var(--ink-hi); }
 .act-btn:disabled { opacity: 0.35; cursor: default; }
 /* 忙：同一个按钮换成「停下」，描边款，别和发送抢注意力 */
 .act-btn[data-mode='stop'] {
   background: #fff;
+  box-shadow: var(--shadow-sm);
   color: var(--red);
   border-color: #e7c4c4;
   font-size: 13px;
@@ -1710,6 +1755,11 @@ body {
 }
 .ghost[hidden] { display: none; }
 @media (max-width: 760px) { .uv-list { grid-template-columns: 1fr; } }
+
+/* 选中文字与键盘焦点：用品牌朱红的淡色，比系统默认蓝统一得多 */
+::selection { background: rgba(200, 16, 46, 0.16); }
+:focus-visible { outline: 2px solid rgba(200, 16, 46, 0.45); outline-offset: 2px; }
+textarea:focus-visible, input:focus-visible { outline: none; } /* 输入类已由外层胶囊 / 自身描边表达焦点 */
 
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: #e2e1dc; border-radius: 9px; border: 2px solid transparent; background-clip: content-box; }

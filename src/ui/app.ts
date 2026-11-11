@@ -1855,7 +1855,9 @@ function applyUvFrame(
   host.style.height = `${oh.toFixed(2)}px`;
   host.style.transformOrigin = 'top left';
   host.style.transform = `scale(${scale.toFixed(4)})`;
-  const body = host.shadowRoot?.querySelector(':scope > div');
+  // 不能写 querySelector(':scope > div')：ShadowRoot 不是元素，:scope 在它上面什么都匹配不到，
+  // 平移补偿就会静默失效、动画伸出盒子被裁。shadow 里恒为 <style> + 包装 <div>，取最后一个子元素。
+  const body = host.shadowRoot?.lastElementChild;
   if (body instanceof HTMLElement) {
     body.style.transformOrigin = 'top left';
     body.style.transform = shiftX || shiftY ? `translate(${shiftX.toFixed(2)}px, ${shiftY.toFixed(2)}px)` : '';
@@ -1888,7 +1890,7 @@ function fitUvBox(box: HTMLElement): void {
   const maxW = Number(box.dataset.uvMaxW) || UV_USE_VIEW.w;
   const maxH = Number(box.dataset.uvMaxH) || UV_USE_VIEW.h;
   const capAtOne = box.dataset.uvCap === '1';
-  const body = host.shadowRoot.querySelector(':scope > div');
+  const body = host.shadowRoot.lastElementChild; // 为什么不用 :scope：见 applyUvFrame
   const holder = document.createElement('div');
   // 父级 32px 会把 shrink-to-fit 挤窄，量尺寸时挪到不受限的离屏节点
   holder.style.cssText = 'position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;';
@@ -1914,15 +1916,42 @@ function fitUvBox(box: HTMLElement): void {
     let minT = hostRect.top;
     let maxR = hostRect.right;
     let maxB = hostRect.bottom;
-    host.shadowRoot.querySelectorAll('*').forEach((node) => {
-      const r = node.getBoundingClientRect();
-      if (r.width < 0.5 && r.height < 0.5) return;
-      if (r.width > 1600 || r.height > 1600) return;
-      minL = Math.min(minL, r.left);
-      minT = Math.min(minT, r.top);
-      maxR = Math.max(maxR, r.right);
-      maxB = Math.max(maxB, r.bottom);
-    });
+    const root = host.shadowRoot;
+    const grow = (): void => {
+      root.querySelectorAll('*').forEach((node) => {
+        const r = node.getBoundingClientRect();
+        if (r.width < 0.5 && r.height < 0.5) return;
+        if (r.width > 1600 || r.height > 1600) return;
+        minL = Math.min(minL, r.left);
+        minT = Math.min(minT, r.top);
+        maxR = Math.max(maxR, r.right);
+        maxB = Math.max(maxB, r.bottom);
+      });
+    };
+    // 只量"此刻这一帧"会漏掉动画中途的形态：3D 旋转的立方体、摆动、放大的元素转到别处就伸出盒子被裁。
+    // 把所有动画拨到同一条时间轴上逐帧采样，取整个周期的外接并集；无动画（或减少动效）时只量一次。
+    // ponytail: 各动画共用时间轴采样 32 帧，周期差异悬殊的组合可能漏掉极端相位；
+    // 要更稳就把采样数提到 64，或按每个动画各自的周期分别扫一遍。
+    const anims = root.getAnimations();
+    if (anims.length === 0) {
+      grow();
+    } else {
+      const span = Math.max(
+        ...anims.map((a) => {
+          const t = a.effect?.getComputedTiming();
+          return Number(t?.delay || 0) + Number(t?.duration || 0);
+        }),
+        1
+      );
+      const STEPS = 32;
+      for (let i = 0; i < STEPS; i++) {
+        anims.forEach((a) => {
+          a.pause();
+          a.currentTime = (span * i) / STEPS;
+        });
+        grow();
+      }
+    }
 
     if (body instanceof HTMLElement) {
       body.style.display = '';
